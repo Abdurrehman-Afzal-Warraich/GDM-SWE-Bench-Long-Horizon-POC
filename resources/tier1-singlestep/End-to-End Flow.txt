@@ -1,0 +1,87 @@
+End-to-End Flow 
+ 1. Select  real Engineering change
+ 2. Freeze exact pre-change repository
+ 3. Sanitize history and network boundary
+ 4. Write behavior-first prompt
+ 5. Run one agent session
+ 6. Run deterministic verifier
+ 7. Run optional quality review
+ 8. Emit eval result and training record
+
+What Harbor Runs
+ 1. Load task.toml
+ 2. Build protected image
+ 3. Mount sanitized repository
+ 4. Run agent with instruction.md
+ 5. Copy protected tests to /tests
+ 6. Execute /tests/test.sh
+ 7. Write numeric reward files
+ 8. Collect logs, patch, trajectory, and artifacts
+
+Environment and Dependencies
+ Dependency and Secret Boundary
+  1. Image build with temporary network
+  2. Pin toolchain and system packages
+  3. Cache locked repository dependencies
+  4. Install pytest and optional RewardKit
+  5. Remove source clone and remotes
+  6. Agent runs with no network
+  7. Deterministic verifier runs offline
+  8. Optional judge uses separate controlled verifier or post-hoc run
+
+Prompt Contract
+ What the Prompt Reveals and withholds
+  1. Reveal observable symptom
+  2. Reveal required invariant
+  3. Reveal legitimate behavior to preserve
+  4. Reveal operational constraints and artifacts
+  5. Withhold PR and future commit
+  6. Withhold exact function and patch recipe
+  7. Withhold hidden variants and reward weights
+  8. Leave diagnosis and implementation open
+
+Deterministic Tests and Optional Judges
+ Verifier Test Architecture
+  1. tests/test.sh
+  2. Build or start repository
+  3. Run test_behavior.py
+  4. Run test_regression.py
+  5. Run test_integration.py
+  6. Run test_integrity.py
+  7. Run executable artifact checks
+  8. Write reward and details
+  9. Stage bounded evidence
+  10.Run optional judges separately
+
+Reward Shape
+ Strict Evaluation and Training Reward
+  1. Validate trial integrity
+  2. Run critical deterministic checks
+  3. Compute strict all-pass condition
+  4. Set binary_reward: 1 only if all pass; otherwise 0
+  5. Preserve weighted check vector
+  6. Optional process and merge-readiness judges
+  7. Export labeled training record
+
+Authoring and Acceptance
+ Task Acceptance
+  1. Real recent change and protected base
+  2. Oracle passes repeatedly 
+  3. No-op always fails
+  4. Seeded partial patches fail named gates
+  5. Hidden variants reject calibration
+  6. Guided run proves solvability
+  7. Unguided frontier
+  8. Freeze prompt, image, verifier and checksum
+
+Evaluation-to-Training Use
+ Evaluation-to-Training Handoff
+  1. Capture trajectory, patch, logs, artifacts
+  2. Attach deterministic reward events
+  3. Attach optional quality scores
+  4. Classify model, verifier, timeout, and contamination failures
+  5. Quarantine invalid trials
+  6. Separate repositories, time window, and variants
+  7. Create SFT, preference, or RL records
+  8. Publish a provenance manifest
+
