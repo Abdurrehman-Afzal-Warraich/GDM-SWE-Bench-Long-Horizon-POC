@@ -1,0 +1,64 @@
+{
+  "stage02": {
+    "files": [
+      "pilot/cmd/pilot-agent/options/options.go",
+      "pilot/pkg/model/context.go",
+      "pkg/bootstrap/config.go",
+      "pkg/bootstrap/option/instances.go",
+      "pkg/bootstrap/testdata/all_golden.json",
+      "pkg/bootstrap/testdata/ambient_golden.json",
+      "pkg/bootstrap/testdata/auth_golden.json",
+      "pkg/bootstrap/testdata/authsds_golden.json",
+      "pkg/bootstrap/testdata/default_golden.json",
+      "pkg/bootstrap/testdata/explicit_internal_address_golden.json",
+      "pkg/bootstrap/testdata/global_downstream_max_connections_both_golden.json",
+      "pkg/bootstrap/testdata/global_downstream_max_connections_meta_golden.json",
+      "pkg/bootstrap/testdata/global_downstream_max_connections_runtime_golden.json",
+      "pkg/bootstrap/testdata/invalid_stats_eviction_interval_golden.json",
+      "pkg/bootstrap/testdata/lrs_golden.json",
+      "pkg/bootstrap/testdata/metrics_no_statsd_golden.json",
+      "pkg/bootstrap/testdata/running_golden.json",
+      "pkg/bootstrap/testdata/runningsds_golden.json",
+      "pkg/bootstrap/testdata/secure_metrics_golden.json",
+      "pkg/bootstrap/testdata/stats_compression_golden.json",
+      "pkg/bootstrap/testdata/stats_eviction_interval_golden.json",
+      "pkg/bootstrap/testdata/stats_flush_interval_golden.json",
+      "pkg/bootstrap/testdata/stats_inclusion_golden.json",
+      "pkg/bootstrap/testdata/stats_interval_golden.json",
+      "pkg/bootstrap/testdata/tracing_datadog_golden.json",
+      "pkg/bootstrap/testdata/tracing_lightstep_golden.json",
+      "pkg/bootstrap/testdata/tracing_none_golden.json",
+      "pkg/bootstrap/testdata/tracing_tls_custom_sni_golden.json",
+      "pkg/bootstrap/testdata/tracing_tls_golden.json",
+      "pkg/bootstrap/testdata/tracing_zipkin_golden.json",
+      "pkg/bootstrap/testdata/xdsproxy_golden.json",
+      "pkg/model/proxy.go",
+      "tools/packaging/common/envoy_bootstrap.json"
+    ],
+    "count": 33
+  },
+  "stage03": {
+    "files": [
+      "pilot/pkg/networking/core/cluster_test.go",
+      "pilot/pkg/networking/core/cluster_traffic_policy.go",
+      "pilot/pkg/networking/core/cluster_traffic_policy_test.go",
+      "pilot/pkg/networking/core/cluster_waypoint.go",
+      "pilot/pkg/networking/core/loadbalancer/loadbalancer.go",
+      "pilot/pkg/networking/core/loadbalancer/loadbalancer_test.go",
+      "pilot/pkg/networking/util/util.go",
+      "pilot/pkg/xds/eds.go",
+      "pilot/pkg/xds/endpoints/endpoint_builder.go"
+    ],
+    "count": 9
+  },
+  "stage04": {
+    "files": [
+      "pilot/pkg/xds/proxy_dependencies.go",
+      "pkg/config/validation/agent/validation.go",
+      "pkg/config/validation/validation.go",
+      "releasenotes/notes/zone-aware-load-balancing.yaml"
+    ],
+    "count": 4
+  },
+  "total_prod_files": 54
+}

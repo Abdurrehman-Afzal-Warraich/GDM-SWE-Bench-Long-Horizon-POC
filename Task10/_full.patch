@@ -1,0 +1,4235 @@
+diff --git a/pilot/cmd/pilot-agent/options/options.go b/pilot/cmd/pilot-agent/options/options.go
+index d09c8a09e63..9f28ada6507 100644
+--- a/pilot/cmd/pilot-agent/options/options.go
++++ b/pilot/cmd/pilot-agent/options/options.go
+@@ -96,6 +96,12 @@ var (
+ 		"The type of the credential fetcher. Currently supported types include GoogleComputeEngine").Get()
+ 	credIdentityProvider = env.Register("CREDENTIAL_IDENTITY_PROVIDER", "GoogleComputeEngine",
+ 		"The identity provider for credential. Currently default supported identity provider is GoogleComputeEngine").Get()
++	// EnableSelfDiscovery controls whether pilot-agent adds a local_cluster static cluster to the bootstrap
++	// for zone-aware routing support. Set ISTIO_META_ENABLE_SELF_DISCOVERY=true via proxyMetadata.
++	EnableSelfDiscovery = env.Register("ISTIO_META_ENABLE_SELF_DISCOVERY", false,
++		"If set to true, pilot-agent will configure a local_cluster static cluster in the Envoy bootstrap "+
++			"to support zone-aware load balancing.")
++
+ 	// DNSCaptureByAgent is a copy of the env var in the init code.
+ 	DNSCaptureByAgent = env.Register("ISTIO_META_DNS_CAPTURE", false,
+ 		"If set to true, enable the capture of outgoing DNS packets on port 53, redirecting to istio-agent on :15053")
+diff --git a/pilot/pkg/model/context.go b/pilot/pkg/model/context.go
+index b11793c1b59..47ddc8cb30c 100644
+--- a/pilot/pkg/model/context.go
++++ b/pilot/pkg/model/context.go
+@@ -303,6 +303,14 @@ type XdsDeltaResourceGenerator interface {
+ 	GenerateDeltas(proxy *Proxy, req *PushRequest, w *WatchedResource) (Resources, DeletedResources, XdsLogDetails, bool, error)
+ }
+ 
++// LocalServiceInfo identifies the local service associated with a proxy: the service's
++// hostname, namespace, and the port used to model the proxy's self-discovery local_cluster.
++type LocalServiceInfo struct {
++	Name      string
++	Namespace string
++	Port      int
++}
++
+ // Proxy contains information about an specific instance of a proxy (envoy sidecar, gateway,
+ // etc). The Proxy is initialized when a sidecar connects to Pilot, and populated from
+ // 'node' info in the protocol as well as data extracted from registries.
+@@ -365,6 +373,16 @@ type Proxy struct {
+ 	// would have 6 entries.
+ 	ServiceTargets []ServiceTarget
+ 
++	// LocalService identifies the local service associated with the proxy. It is populated in
++	// SetServiceTargets from the first entry in ServiceTargets, or the zero value if there is none.
++	// Carrying the port here avoids re-deriving it from ServiceTargets when building the
++	// self-discovery local_cluster, and lets incremental pushes detect port changes.
++	LocalService LocalServiceInfo
++
++	// PrevLocalService is the value of LocalService prior to the most recent SetServiceTargets call,
++	// used to detect local-service transitions during incremental pushes.
++	PrevLocalService LocalServiceInfo
++
+ 	// Istio version associated with the Proxy
+ 	IstioVersion *IstioVersion
+ 
+@@ -608,6 +626,15 @@ func (node *Proxy) SetServiceTargets(serviceDiscovery ServiceDiscovery) {
+ 		return -1
+ 	})
+ 
++	node.PrevLocalService = node.LocalService
++	node.LocalService = LocalServiceInfo{}
++	if len(instances) > 0 {
++		node.LocalService = LocalServiceInfo{
++			Name:      string(instances[0].Service.Hostname),
++			Namespace: instances[0].Service.Attributes.Namespace,
++			Port:      instances[0].Port.Port,
++		}
++	}
+ 	node.ServiceTargets = instances
+ }
+ 
+diff --git a/pilot/pkg/model/context_test.go b/pilot/pkg/model/context_test.go
+index 349d7683b1a..92877a20c9f 100644
+--- a/pilot/pkg/model/context_test.go
++++ b/pilot/pkg/model/context_test.go
+@@ -304,24 +304,28 @@ func Test_parseIstioVersion(t *testing.T) {
+ 
+ func TestSetServiceInstances(t *testing.T) {
+ 	tnow := time.Now()
++	dummyPort := &model.Port{Port: 80}
+ 	instances := []model.ServiceTarget{
+ 		{
+ 			Service: &model.Service{
+ 				CreationTime: tnow.Add(1 * time.Second),
+ 				Hostname:     host.Name("test1.com"),
+ 			},
++			Port: model.ServiceInstancePort{ServicePort: dummyPort},
+ 		},
+ 		{
+ 			Service: &model.Service{
+ 				CreationTime: tnow,
+ 				Hostname:     host.Name("test3.com"),
+ 			},
++			Port: model.ServiceInstancePort{ServicePort: dummyPort},
+ 		},
+ 		{
+ 			Service: &model.Service{
+ 				CreationTime: tnow,
+ 				Hostname:     host.Name("test2.com"),
+ 			},
++			Port: model.ServiceInstancePort{ServicePort: dummyPort},
+ 		},
+ 	}
+ 
+diff --git a/pilot/pkg/networking/core/cluster_test.go b/pilot/pkg/networking/core/cluster_test.go
+index 7111598168f..b545c465d56 100644
+--- a/pilot/pkg/networking/core/cluster_test.go
++++ b/pilot/pkg/networking/core/cluster_test.go
+@@ -2670,7 +2670,7 @@ func TestApplyLoadBalancer(t *testing.T) {
+ 				test.SetForTest(t, &features.EnableRedisFilter, true)
+ 			}
+ 
+-			applyLoadBalancer(nil, c, tt.lbSettings, tt.port, proxy.Locality, tt.proxyLabels, &meshconfig.MeshConfig{}, nil)
++			applyLoadBalancer(nil, c, tt.lbSettings, tt.port, proxy.Locality, tt.proxyLabels, &meshconfig.MeshConfig{}, nil, proxy.Type, "", false)
+ 
+ 			if c.LbPolicy != tt.expectedLbPolicy {
+ 				t.Errorf("cluster LbPolicy %s != expected %s", c.LbPolicy, tt.expectedLbPolicy)
+diff --git a/pilot/pkg/networking/core/cluster_traffic_policy.go b/pilot/pkg/networking/core/cluster_traffic_policy.go
+index db1fd0b8ad4..f8903519255 100644
+--- a/pilot/pkg/networking/core/cluster_traffic_policy.go
++++ b/pilot/pkg/networking/core/cluster_traffic_policy.go
+@@ -53,7 +53,12 @@ func (cb *ClusterBuilder) applyTrafficPolicy(service *model.Service, opts buildC
+ 	cb.applyConnectionPool(opts.mesh, opts.mutable, connectionPool, retryBudget)
+ 	if opts.direction != model.TrafficDirectionInbound {
+ 		applyOutlierDetection(service, opts.mutable.cluster, outlierDetection)
+-		applyLoadBalancer(service, opts.mutable.cluster, loadBalancer, opts.port, cb.locality, cb.proxyLabels, opts.mesh, opts.mutable.dnsWrappedLocalityLbEndpoints)
++		enableSelfDiscovery := cb.proxyMetadata != nil && bool(cb.proxyMetadata.EnableSelfDiscovery)
++		applyLoadBalancer(
++			service, opts.mutable.cluster, loadBalancer, opts.port, cb.locality,
++			cb.proxyLabels, opts.mesh, opts.mutable.dnsWrappedLocalityLbEndpoints,
++			cb.proxyType, cb.proxyID, enableSelfDiscovery,
++		)
+ 		if opts.clusterMode != SniDnatClusterMode {
+ 			autoMTLSEnabled := opts.mesh.GetEnableAutoMtls().Value
+ 			tls, mtlsCtxType := cb.buildUpstreamTLSSettings(tls, opts.serviceAccounts, opts.istioMtlsSni,
+@@ -307,6 +312,9 @@ func applyLoadBalancer(
+ 	proxyLabels map[string]string,
+ 	meshConfig *meshconfig.MeshConfig,
+ 	wrappedLocalityLbEndpoints *loadbalancer.WrappedLocalityLbEndpoints,
++	proxyType model.NodeType,
++	proxyID string,
++	enableSelfDiscovery bool,
+ ) {
+ 	// DFP clusters (DYNAMIC_DNS ServiceEntries) use CLUSTER_PROVIDED LB policy
+ 	if c.LbPolicy == cluster.Cluster_CLUSTER_PROVIDED {
+@@ -317,9 +325,20 @@ func applyLoadBalancer(
+ 	if svc.SupportsUnhealthyEndpoints() {
+ 		c.CommonLbConfig.HealthyPanicThreshold = &xdstype.Percent{Value: 0}
+ 	}
+-	// Use locality lb settings from load balancer settings if present, else use mesh wide locality lb settings
+-	localityLbSetting, forceFailover := loadbalancer.GetLocalityLbSetting(meshConfig.GetLocalityLbSetting(), lb.GetLocalityLbSetting(), svc)
+-	applyLocalityLoadBalancer(locality, proxyLabels, c, wrappedLocalityLbEndpoints, localityLbSetting, forceFailover)
++	lbSettings := loadbalancer.GetEffectiveLbSetting(
++		meshConfig.GetLocalityLbSetting(),
++		meshConfig.GetZoneAwareLbSetting(),
++		lb,
++		svc,
++	)
++	if lbSettings == nil {
++		// No effective locality/zone-aware setting; fall back to the default locality LB cluster config.
++		lbSettings = loadbalancer.LocalityLBSettings{}
++	}
++	lbSettings.ApplyToCluster(
++		c, wrappedLocalityLbEndpoints, locality, proxyLabels,
++		proxyType == model.Waypoint, proxyID, enableSelfDiscovery,
++	)
+ 
+ 	if c.GetType() == cluster.Cluster_ORIGINAL_DST {
+ 		c.LbPolicy = cluster.Cluster_CLUSTER_PROVIDED
+@@ -353,38 +372,6 @@ func applyLoadBalancer(
+ 	ApplyRingHashLoadBalancer(c, lb)
+ }
+ 
+-func applyLocalityLoadBalancer(
+-	locality *core.Locality,
+-	proxyLabels map[string]string,
+-	c *cluster.Cluster,
+-	wrappedLocalityLbEndpoints *loadbalancer.WrappedLocalityLbEndpoints,
+-	localityLB *networking.LocalityLoadBalancerSetting,
+-	failover bool,
+-) {
+-	// Failover should only be applied with outlier detection, or traffic will never failover.
+-	// Conversely, because the default mesh config enables LocalityLbSetting (Enabled:true),
+-	// enabling outlier detection in a DestinationRule will automatically activate locality LB
+-	// failover behavior even when no explicit localityLbSetting is configured in the DR.
+-	enableFailover := failover || c.OutlierDetection != nil
+-	// set locality weighted lb config when locality lb is enabled, otherwise it will influence the result of LBPolicy like `least request`
+-	if features.EnableLocalityWeightedLbConfig ||
+-		(enableFailover && (localityLB.GetFailover() != nil || localityLB.GetFailoverPriority() != nil)) ||
+-		localityLB.GetDistribute() != nil {
+-		c.CommonLbConfig.LocalityConfigSpecifier = &cluster.Cluster_CommonLbConfig_LocalityWeightedLbConfig_{
+-			LocalityWeightedLbConfig: &cluster.Cluster_CommonLbConfig_LocalityWeightedLbConfig{},
+-		}
+-	}
+-
+-	if c.LoadAssignment != nil {
+-		var wrapped []*loadbalancer.WrappedLocalityLbEndpoints
+-		if wrappedLocalityLbEndpoints != nil {
+-			wrapped = []*loadbalancer.WrappedLocalityLbEndpoints{wrappedLocalityLbEndpoints}
+-		}
+-		loadbalancer.ApplyLocalityLoadBalancer(c.LoadAssignment,
+-			wrapped, locality, proxyLabels, localityLB, enableFailover)
+-	}
+-}
+-
+ // applySimpleDefaultLoadBalancer will set the DefaultLBPolicy and create an LbConfig if used in LoadBalancerSettings
+ func applySimpleDefaultLoadBalancer(c *cluster.Cluster, loadbalancer *networking.LoadBalancerSettings) {
+ 	c.LbPolicy = defaultLBAlgorithm()
+diff --git a/pilot/pkg/networking/core/cluster_traffic_policy_test.go b/pilot/pkg/networking/core/cluster_traffic_policy_test.go
+index 4187bede11e..a4c6389a543 100644
+--- a/pilot/pkg/networking/core/cluster_traffic_policy_test.go
++++ b/pilot/pkg/networking/core/cluster_traffic_policy_test.go
+@@ -21,6 +21,7 @@ import (
+ 
+ 	cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
+ 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
++	endpoint "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
+ 	proxyprotocol "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/proxy_protocol/v3"
+ 	tls "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
+ 	wrappers "google.golang.org/protobuf/types/known/wrapperspb"
+@@ -28,6 +29,7 @@ import (
+ 	meshconfig "istio.io/api/mesh/v1alpha1"
+ 	networking "istio.io/api/networking/v1alpha3"
+ 	"istio.io/istio/pilot/pkg/model"
++	"istio.io/istio/pilot/pkg/networking/core/loadbalancer"
+ 	"istio.io/istio/pilot/pkg/networking/util"
+ 	"istio.io/istio/pkg/test/util/assert"
+ )
+@@ -306,3 +308,93 @@ func TestApplyUpstreamProxyProtocol(t *testing.T) {
+ 		})
+ 	}
+ }
++
++// TestApplyZoneAwareLoadBalancer covers the cluster-level zone-aware wiring:
++//   - With enableSelfDiscovery=true, sets CommonLbConfig.ZoneAwareLbConfig
++//     and propagates MinClusterSize from the ZoneAwareLoadBalancerSetting.
++//   - With enableSelfDiscovery=false, leaves CommonLbConfig.LocalityConfigSpecifier unset.
++//   - Region-bucketing on the cluster's LoadAssignment is delegated to the loadbalancer
++//     package and exercised end-to-end here.
++func TestApplyZoneAwareLoadBalancer(t *testing.T) {
++	proxyLocality := &core.Locality{Region: "region1", Zone: "zone1", SubZone: "subzone1"}
++
++	newCluster := func() *cluster.Cluster {
++		return &cluster.Cluster{
++			Name:           "outbound|80||svc.default.svc.cluster.local",
++			CommonLbConfig: &cluster.Cluster_CommonLbConfig{},
++			LoadAssignment: &endpoint.ClusterLoadAssignment{
++				Endpoints: []*endpoint.LocalityLbEndpoints{
++					{Locality: &core.Locality{Region: "region1", Zone: "zone1", SubZone: "subzone1"}},
++					{Locality: &core.Locality{Region: "region1", Zone: "zone2", SubZone: "subzone1"}},
++					{Locality: &core.Locality{Region: "region2", Zone: "zone1", SubZone: "subzone1"}},
++				},
++			},
++		}
++	}
++
++	t.Run("sets ZoneAwareLbConfig with MinClusterSize", func(t *testing.T) {
++		c := newCluster()
++		za := &networking.ZoneAwareLoadBalancerSetting{
++			Enabled:        wrappers.Bool(true),
++			MinClusterSize: &wrappers.UInt64Value{Value: 7},
++		}
++		loadbalancer.ZoneAwareLBSettings{Setting: za}.ApplyToCluster(c, nil, proxyLocality, nil, false, "test-proxy", true)
++		zaCfg := c.CommonLbConfig.GetZoneAwareLbConfig()
++		if zaCfg == nil {
++			t.Fatal("expected CommonLbConfig.ZoneAwareLbConfig to be set")
++		}
++		if zaCfg.GetMinClusterSize().GetValue() != 7 {
++			t.Errorf("MinClusterSize = %v, want 7", zaCfg.GetMinClusterSize())
++		}
++	})
++
++	t.Run("sets ZoneAwareLbConfig with nil MinClusterSize", func(t *testing.T) {
++		c := newCluster()
++		za := &networking.ZoneAwareLoadBalancerSetting{Enabled: wrappers.Bool(true)}
++		loadbalancer.ZoneAwareLBSettings{Setting: za}.ApplyToCluster(c, nil, proxyLocality, nil, false, "test-proxy", true)
++		zaCfg := c.CommonLbConfig.GetZoneAwareLbConfig()
++		if zaCfg == nil {
++			t.Fatal("expected ZoneAwareLbConfig to be set even without MinClusterSize")
++		}
++		if zaCfg.GetMinClusterSize() != nil {
++			t.Errorf("MinClusterSize = %v, want nil", zaCfg.GetMinClusterSize())
++		}
++	})
++
++	t.Run("self-discovery off still sets ZoneAwareLbConfig and emits warning", func(t *testing.T) {
++		c := newCluster()
++		za := &networking.ZoneAwareLoadBalancerSetting{
++			Enabled:        wrappers.Bool(true),
++			MinClusterSize: &wrappers.UInt64Value{Value: 7},
++		}
++		// ZoneAwareLbConfig is always set; enableSelfDiscovery=false only triggers a warning.
++		loadbalancer.ZoneAwareLBSettings{Setting: za}.ApplyToCluster(c, nil, proxyLocality, nil, false, "test-proxy", false)
++		if c.CommonLbConfig.GetZoneAwareLbConfig() == nil {
++			t.Error("expected ZoneAwareLbConfig to be set even when self-discovery is off")
++		}
++	})
++
++	t.Run("region-buckets CLA priorities", func(t *testing.T) {
++		c := newCluster()
++		za := &networking.ZoneAwareLoadBalancerSetting{Enabled: wrappers.Bool(true)}
++		loadbalancer.ZoneAwareLBSettings{Setting: za}.ApplyToCluster(c, nil, proxyLocality, nil, false, "test-proxy", true)
++		// region1 endpoints (any zone) → 0, region2 → 1.
++		want := []uint32{0, 0, 1}
++		for i, ep := range c.LoadAssignment.Endpoints {
++			if ep.Priority != want[i] {
++				t.Errorf("endpoint[%d] locality %v: got priority %d, want %d",
++					i, ep.Locality, ep.Priority, want[i])
++			}
++		}
++	})
++
++	t.Run("nil LoadAssignment is safe", func(t *testing.T) {
++		c := &cluster.Cluster{CommonLbConfig: &cluster.Cluster_CommonLbConfig{}}
++		za := &networking.ZoneAwareLoadBalancerSetting{Enabled: wrappers.Bool(true)}
++		loadbalancer.ZoneAwareLBSettings{Setting: za}.ApplyToCluster(c, nil, proxyLocality, nil, false, "test-proxy", true)
++		// ZoneAwareLbConfig still gets set even without a LoadAssignment.
++		if c.CommonLbConfig.GetZoneAwareLbConfig() == nil {
++			t.Error("expected ZoneAwareLbConfig set even with nil LoadAssignment")
++		}
++	})
++}
+diff --git a/pilot/pkg/networking/core/cluster_waypoint.go b/pilot/pkg/networking/core/cluster_waypoint.go
+index a8fea366561..1b7fa5173a8 100644
+--- a/pilot/pkg/networking/core/cluster_waypoint.go
++++ b/pilot/pkg/networking/core/cluster_waypoint.go
+@@ -204,7 +204,8 @@ func (cb *ClusterBuilder) buildWaypointInboundVIPCluster(
+ 		connectionPool.Http = nil
+ 		cb.applyConnectionPool(mesh, localCluster, connectionPool, retryBudget)
+ 		applyOutlierDetection(nil, localCluster.cluster, outlierDetection)
+-		applyLoadBalancer(svc, localCluster.cluster, loadBalancer, &port, cb.locality, cb.proxyLabels, mesh, nil)
++		applyLoadBalancer(svc, localCluster.cluster, loadBalancer, &port, cb.locality, cb.proxyLabels, mesh, nil, cb.proxyType, cb.proxyID, false)
++
+ 		// TODO: Decide if we want to support this
+ 		if localCluster.cluster.GetType() == cluster.Cluster_ORIGINAL_DST {
+ 			log.Warnf("Passthrough on the east/west gateway isn't expected")
+@@ -224,7 +225,7 @@ func (cb *ClusterBuilder) buildWaypointInboundVIPCluster(
+ 
+ 	// Unless the svc resolution type is DynamicDNS, we apply the LB settings
+ 	if svc.Resolution != model.DynamicDNS {
+-		applyLoadBalancer(svc, localCluster.cluster, loadBalancer, &port, cb.locality, cb.proxyLabels, mesh, nil)
++		applyLoadBalancer(svc, localCluster.cluster, loadBalancer, &port, cb.locality, cb.proxyLabels, mesh, nil, cb.proxyType, cb.proxyID, false)
+ 	}
+ 
+ 	// Setup EDS config after apply LoadBalancer, since it can impact the result
+diff --git a/pilot/pkg/networking/core/loadbalancer/loadbalancer.go b/pilot/pkg/networking/core/loadbalancer/loadbalancer.go
+index d85920e507b..59b35657278 100644
+--- a/pilot/pkg/networking/core/loadbalancer/loadbalancer.go
++++ b/pilot/pkg/networking/core/loadbalancer/loadbalancer.go
+@@ -20,15 +20,18 @@ import (
+ 	"sort"
+ 	"strings"
+ 
++	cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
+ 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+ 	endpoint "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
+ 	wrappers "google.golang.org/protobuf/types/known/wrapperspb"
+ 
+ 	"istio.io/api/label"
+ 	"istio.io/api/networking/v1alpha3"
++	"istio.io/istio/pilot/pkg/features"
+ 	"istio.io/istio/pilot/pkg/model"
+ 	"istio.io/istio/pilot/pkg/networking/util"
+ 	registrylabel "istio.io/istio/pilot/pkg/serviceregistry/util/label"
++	"istio.io/istio/pkg/log"
+ 	"istio.io/istio/pkg/util/sets"
+ )
+ 
+@@ -36,50 +39,314 @@ const (
+ 	FailoverPriorityLabelDefaultSeparator = '='
+ )
+ 
+-func GetLocalityLbSetting(
+-	mesh *v1alpha3.LocalityLoadBalancerSetting,
+-	destrule *v1alpha3.LocalityLoadBalancerSetting,
++// LBSettings captures the effective load-balancing locality semantics resolved from a
++// DR / service / mesh combination. A concrete value is either a *LocalityLBSettings or a
++// *ZoneAwareLBSettings; GetEffectiveLbSetting returns nil when locality load balancing is
++// effectively disabled.
++type LBSettings interface {
++	// ForceFailover reports whether failover must always be enabled, regardless of whether
++	// outlier detection is configured.
++	ForceFailover() bool
++	// IsZoneAware reports whether these are zone-aware settings (as opposed to locality settings).
++	IsZoneAware() bool
++	// FailoverPriorityLabels returns the failover priority labels used to compute per-proxy
++	// failover priority labels, or nil when none apply.
++	FailoverPriorityLabels() []string
++	// ApplyToLoadAssignment mutates loadAssignment with the locality/zone-aware priorities and
++	// weights relative to the calling proxy. enableFailover reflects whether outlier detection is
++	// configured; implementations additionally force failover on when ForceFailover reports true.
++	ApplyToLoadAssignment(
++		loadAssignment *endpoint.ClusterLoadAssignment,
++		wrappedLocalityLbEndpoints []*WrappedLocalityLbEndpoints,
++		locality *core.Locality,
++		proxyLabels map[string]string,
++		enableFailover bool,
++	)
++	// ApplyToCluster configures the cluster's locality LB config (CommonLbConfig) and applies the
++	// locality/zone-aware priorities and weights to its load assignment for the calling proxy.
++	// isWaypoint indicates the proxy is a waypoint, where zone-aware LB is unsupported and falls
++	// back to locality LB. proxyID and enableSelfDiscovery are only used to warn when zone-aware
++	// LB is configured without proxy self-discovery.
++	ApplyToCluster(
++		c *cluster.Cluster,
++		wrappedLocalityLbEndpoints *WrappedLocalityLbEndpoints,
++		locality *core.Locality,
++		proxyLabels map[string]string,
++		isWaypoint bool,
++		proxyID string,
++		enableSelfDiscovery bool,
++	)
++}
++
++// wrapEndpoints adapts a single WrappedLocalityLbEndpoints to the slice form expected by the
++// package-level Apply* helpers, preserving the nil case.
++func wrapEndpoints(w *WrappedLocalityLbEndpoints) []*WrappedLocalityLbEndpoints {
++	if w == nil {
++		return nil
++	}
++	return []*WrappedLocalityLbEndpoints{w}
++}
++
++// LocalityLBSettings is the effective locality load balancer setting.
++type LocalityLBSettings struct {
++	Setting *v1alpha3.LocalityLoadBalancerSetting
++	// Force reports whether failover must always be enabled (e.g. derived from a service's
++	// TrafficDistribution preference).
++	Force bool
++}
++
++var _ LBSettings = LocalityLBSettings{}
++
++func (l LocalityLBSettings) ForceFailover() bool { return l.Force }
++
++func (l LocalityLBSettings) IsZoneAware() bool { return false }
++
++func (l LocalityLBSettings) FailoverPriorityLabels() []string {
++	// Failover priority labels only apply when there is no explicit weight distribution and
++	// locality LB is enabled.
++	if l.Setting.GetDistribute() == nil && (l.Setting.GetEnabled() == nil || l.Setting.GetEnabled().Value) {
++		return l.Setting.GetFailoverPriority()
++	}
++	return nil
++}
++
++func (l LocalityLBSettings) ApplyToLoadAssignment(
++	loadAssignment *endpoint.ClusterLoadAssignment,
++	wrappedLocalityLbEndpoints []*WrappedLocalityLbEndpoints,
++	locality *core.Locality,
++	proxyLabels map[string]string,
++	enableFailover bool,
++) {
++	ApplyLocalityLoadBalancer(loadAssignment, wrappedLocalityLbEndpoints, locality, proxyLabels, l.Setting, enableFailover || l.Force)
++}
++
++func (l LocalityLBSettings) ApplyToCluster(
++	c *cluster.Cluster,
++	wrappedLocalityLbEndpoints *WrappedLocalityLbEndpoints,
++	locality *core.Locality,
++	proxyLabels map[string]string,
++	_ bool,
++	_ string,
++	_ bool,
++) {
++	// Failover should only be applied with outlier detection, or traffic will never failover.
++	// Conversely, because the default mesh config enables LocalityLbSetting (Enabled:true),
++	// enabling outlier detection in a DestinationRule will automatically activate locality LB
++	// failover behavior even when no explicit localityLbSetting is configured in the DR.
++	enableFailover := l.Force || c.OutlierDetection != nil
++	// set locality weighted lb config when locality lb is enabled, otherwise it will influence the result of LBPolicy like `least request`
++	if features.EnableLocalityWeightedLbConfig ||
++		(enableFailover && (l.Setting.GetFailover() != nil || l.Setting.GetFailoverPriority() != nil)) ||
++		l.Setting.GetDistribute() != nil {
++		c.CommonLbConfig.LocalityConfigSpecifier = &cluster.Cluster_CommonLbConfig_LocalityWeightedLbConfig_{
++			LocalityWeightedLbConfig: &cluster.Cluster_CommonLbConfig_LocalityWeightedLbConfig{},
++		}
++	}
++	if c.LoadAssignment != nil {
++		l.ApplyToLoadAssignment(c.LoadAssignment, wrapEndpoints(wrappedLocalityLbEndpoints), locality, proxyLabels, c.OutlierDetection != nil)
++	}
++}
++
++// ZoneAwareLBSettings is the effective zone-aware load balancer setting.
++type ZoneAwareLBSettings struct {
++	Setting *v1alpha3.ZoneAwareLoadBalancerSetting
++}
++
++var _ LBSettings = ZoneAwareLBSettings{}
++
++// ForceFailover always returns true: similar to TrafficDistributionPreferSameZone, zone-aware
++// routing requires that we always enable failovers, since we need to always separate endpoints
++// in different regions.
++func (z ZoneAwareLBSettings) ForceFailover() bool { return true }
++
++func (z ZoneAwareLBSettings) IsZoneAware() bool { return true }
++
++func (z ZoneAwareLBSettings) FailoverPriorityLabels() []string {
++	return z.Setting.GetFailoverPriority()
++}
++
++func (z ZoneAwareLBSettings) ApplyToLoadAssignment(
++	loadAssignment *endpoint.ClusterLoadAssignment,
++	wrappedLocalityLbEndpoints []*WrappedLocalityLbEndpoints,
++	locality *core.Locality,
++	proxyLabels map[string]string,
++	_ bool,
++) {
++	ApplyZoneAwareLoadBalancer(loadAssignment, wrappedLocalityLbEndpoints, locality, proxyLabels, z.Setting)
++}
++
++func (z ZoneAwareLBSettings) ApplyToCluster(
++	c *cluster.Cluster,
++	wrappedLocalityLbEndpoints *WrappedLocalityLbEndpoints,
++	locality *core.Locality,
++	proxyLabels map[string]string,
++	isWaypoint bool,
++	proxyID string,
++	enableSelfDiscovery bool,
++) {
++	// Zone-aware LB is not supported for Waypoints; fall back to locality LB. Zone-aware always
++	// forces failover, so preserve that in the fallback (there is no locality setting configured,
++	// as the two are mutually exclusive).
++	if isWaypoint {
++		LocalityLBSettings{Force: true}.ApplyToCluster(
++			c, wrappedLocalityLbEndpoints, locality, proxyLabels, isWaypoint, proxyID, enableSelfDiscovery,
++		)
++		return
++	}
++	if !enableSelfDiscovery {
++		log.Warnf("Zone-aware load balancing is enabled for cluster %s, but proxy self-discovery is not enabled on %s", c.Name, proxyID)
++	}
++	c.CommonLbConfig.LocalityConfigSpecifier = &cluster.Cluster_CommonLbConfig_ZoneAwareLbConfig_{
++		ZoneAwareLbConfig: &cluster.Cluster_CommonLbConfig_ZoneAwareLbConfig{
++			MinClusterSize: z.Setting.GetMinClusterSize(),
++		},
++	}
++	if c.LoadAssignment != nil {
++		z.ApplyToLoadAssignment(c.LoadAssignment, wrapEndpoints(wrappedLocalityLbEndpoints), locality, proxyLabels, false)
++	}
++}
++
++// GetEffectiveLbSetting resolves which load-balancing locality semantics apply for a
++// given DR / service / mesh combination. It returns nil when locality load balancing is
++// effectively disabled.
++func GetEffectiveLbSetting(
++	meshLocality *v1alpha3.LocalityLoadBalancerSetting,
++	meshZoneAware *v1alpha3.ZoneAwareLoadBalancerSetting,
++	drSettings *v1alpha3.LoadBalancerSettings,
+ 	service *model.Service,
+-) (*v1alpha3.LocalityLoadBalancerSetting, bool) {
+-	if destrule != nil {
+-		if destrule.Enabled != nil && !destrule.Enabled.Value {
+-			return nil, false
++) LBSettings {
++	if zaLbSetting := drSettings.GetZoneAwareLbSetting(); zaLbSetting != nil {
++		if zaLbSetting.GetEnabled() != nil && !zaLbSetting.GetEnabled().Value {
++			return nil
++		}
++		return ZoneAwareLBSettings{Setting: zaLbSetting}
++	}
++	if localityLbSetting := drSettings.GetLocalityLbSetting(); localityLbSetting != nil {
++		if localityLbSetting.GetEnabled() != nil && !localityLbSetting.GetEnabled().Value {
++			return nil
+ 		}
+-		return destrule, false
++		return LocalityLBSettings{Setting: localityLbSetting}
+ 	}
+ 	if service != nil && service.Attributes.TrafficDistribution != model.TrafficDistributionAny {
+ 		switch service.Attributes.TrafficDistribution {
+ 		case model.TrafficDistributionPreferSameZone:
+-			return &v1alpha3.LocalityLoadBalancerSetting{
+-				Enabled: wrappers.Bool(true),
+-				// Prefer same zone, region, network
+-				FailoverPriority: []string{
+-					label.TopologyNetwork.Name,
+-					registrylabel.LabelTopologyRegion,
+-					registrylabel.LabelTopologyZone,
++			return LocalityLBSettings{
++				Setting: &v1alpha3.LocalityLoadBalancerSetting{
++					Enabled: wrappers.Bool(true),
++					// Prefer same zone, region, network
++					FailoverPriority: []string{
++						label.TopologyNetwork.Name,
++						registrylabel.LabelTopologyRegion,
++						registrylabel.LabelTopologyZone,
++					},
+ 				},
+-			}, true
++				Force: true,
++			}
+ 		case model.TrafficDistributionPreferSameNode:
+-			return &v1alpha3.LocalityLoadBalancerSetting{
+-				Enabled: wrappers.Bool(true),
+-				// Prefer same node, subzone, zone, region, network
+-				FailoverPriority: []string{
+-					label.TopologyNetwork.Name,
+-					registrylabel.LabelTopologyRegion,
+-					registrylabel.LabelTopologyZone,
+-					label.TopologySubzone.Name,
+-					registrylabel.LabelHostname,
++			return LocalityLBSettings{
++				Setting: &v1alpha3.LocalityLoadBalancerSetting{
++					Enabled: wrappers.Bool(true),
++					// Prefer same node, subzone, zone, region, network
++					FailoverPriority: []string{
++						label.TopologyNetwork.Name,
++						registrylabel.LabelTopologyRegion,
++						registrylabel.LabelTopologyZone,
++						label.TopologySubzone.Name,
++						registrylabel.LabelHostname,
++					},
+ 				},
+-			}, true
++				Force: true,
++			}
+ 		case model.TrafficDistributionAny:
+ 			// fallthrough
+ 		}
+ 	}
+-	msh := mesh.GetEnabled()
+-	if msh != nil && !msh.Value {
+-		return nil, false
++	if meshZoneAware != nil {
++		if meshZoneAware.GetEnabled() != nil && !meshZoneAware.GetEnabled().Value {
++			return nil
++		}
++		return ZoneAwareLBSettings{Setting: meshZoneAware}
++	}
++	if meshLocality != nil {
++		if meshLocality.GetEnabled() != nil && !meshLocality.GetEnabled().Value {
++			return nil
++		}
++		return LocalityLBSettings{Setting: meshLocality}
++	}
++	return nil
++}
++
++func ApplyZoneAwareLoadBalancer(
++	loadAssignment *endpoint.ClusterLoadAssignment,
++	wrappedLocalityLbEndpoints []*WrappedLocalityLbEndpoints,
++	locality *core.Locality,
++	proxyLabels map[string]string,
++	zoneAwareLB *v1alpha3.ZoneAwareLoadBalancerSetting,
++) {
++	if zoneAwareLB == nil || loadAssignment == nil {
++		return
++	}
++	if len(zoneAwareLB.FailoverPriority) > 0 {
++		applyFailoverPriorities(loadAssignment, wrappedLocalityLbEndpoints, proxyLabels, zoneAwareLB.FailoverPriority)
++	}
++
++	// Always apply region bucketing, even with no Failover entries. This keeps
++	// cross-region endpoints out of priority 0 so Envoy's zone-aware LB only balances zones
++	// within the proxy's region.
++	applyZoneAwareRegionalFailover(locality, loadAssignment, zoneAwareLB.Failover)
++}
++
++// applyZoneAwareRegionalFailover buckets LocalityLbEndpoints by region only, so all endpoints in the
++// proxy's region land at priority 0 (where Envoy's zone-aware LB can balance them across zones).
++// Failover-matched regions occupy the next priority and remaining regions the last priority.
++// Like applyLocalityFailover, priorities are multiplied by 3 to compose with any prior
++// FailoverPriority assignment, then compacted to a contiguous 0..N range.
++func applyZoneAwareRegionalFailover(
++	locality *core.Locality,
++	loadAssignment *endpoint.ClusterLoadAssignment,
++	failover []*v1alpha3.ZoneAwareLoadBalancerSetting_Failover,
++) {
++	priorityMap := map[int][]int{}
++	proxyRegion := locality.GetRegion()
++
++	for i, localityEndpoint := range loadAssignment.Endpoints {
++		epRegion := localityEndpoint.GetLocality().GetRegion()
++		// 0: same region as proxy, 1: failover-matched region, 2: any other region.
++		var priority int
++		switch {
++		case epRegion == proxyRegion:
++			priority = 0
++		default:
++			priority = 2
++			for _, failoverSetting := range failover {
++				if failoverSetting.From == proxyRegion {
++					if epRegion == failoverSetting.To {
++						priority = 1
++					}
++					break
++				}
++			}
++		}
++		// Compose with any prior priority (e.g. set by applyFailoverPriorities).
++		// Zone-aware uses 3 buckets (0..2) so multiplying by 3 keeps the slots distinct.
++		priorityInt := int(loadAssignment.Endpoints[i].Priority*3) + priority
++		loadAssignment.Endpoints[i].Priority = uint32(priorityInt)
++		priorityMap[priorityInt] = append(priorityMap[priorityInt], i)
++	}
++
++	// Compact priorities to a contiguous 0..N range so Envoy doesn't skip empty buckets.
++	priorities := make([]int, 0, len(priorityMap))
++	for priority := range priorityMap {
++		priorities = append(priorities, priority)
++	}
++	sort.Ints(priorities)
++	for i, priority := range priorities {
++		if i != priority {
++			for _, index := range priorityMap[priority] {
++				loadAssignment.Endpoints[index].Priority = uint32(i)
++			}
++		}
+ 	}
+-	return mesh, false
+ }
+ 
+ func ApplyLocalityLoadBalancer(
+diff --git a/pilot/pkg/networking/core/loadbalancer/loadbalancer_test.go b/pilot/pkg/networking/core/loadbalancer/loadbalancer_test.go
+index efa920186cc..8ac810d17c4 100644
+--- a/pilot/pkg/networking/core/loadbalancer/loadbalancer_test.go
++++ b/pilot/pkg/networking/core/loadbalancer/loadbalancer_test.go
+@@ -1000,7 +1000,7 @@ func TestApplyLocalitySetting(t *testing.T) {
+ 	})
+ }
+ 
+-func TestGetLocalityLbSetting(t *testing.T) {
++func TestGetEffectiveLbSetting(t *testing.T) {
+ 	// dummy config for test
+ 	preferSameZoneService := &model.Service{Attributes: model.ServiceAttributes{K8sAttributes: model.K8sAttributes{
+ 		TrafficDistribution: model.TrafficDistributionPreferSameZone,
+@@ -1009,124 +1009,296 @@ func TestGetLocalityLbSetting(t *testing.T) {
+ 		TrafficDistribution: model.TrafficDistributionPreferSameNode,
+ 	}}}
+ 	failover := []*networking.LocalityLoadBalancerSetting_Failover{nil}
++	zaFailover := []*networking.ZoneAwareLoadBalancerSetting_Failover{{From: "r1", To: "r2"}}
++	drLB := func(l *networking.LocalityLoadBalancerSetting) *networking.LoadBalancerSettings {
++		if l == nil {
++			return nil
++		}
++		return &networking.LoadBalancerSettings{LocalityLbSetting: l}
++	}
++	drZA := func(z *networking.ZoneAwareLoadBalancerSetting) *networking.LoadBalancerSettings {
++		if z == nil {
++			return nil
++		}
++		return &networking.LoadBalancerSettings{ZoneAwareLbSetting: z}
++	}
++	preferSameZoneExpected := &networking.LocalityLoadBalancerSetting{
++		FailoverPriority: []string{
++			label.TopologyNetwork.Name,
++			registrylabel.LabelTopologyRegion,
++			registrylabel.LabelTopologyZone,
++		},
++		Enabled: &wrappers.BoolValue{Value: true},
++	}
++	preferSameNodeExpected := &networking.LocalityLoadBalancerSetting{
++		FailoverPriority: []string{
++			label.TopologyNetwork.Name,
++			registrylabel.LabelTopologyRegion,
++			registrylabel.LabelTopologyZone,
++			label.TopologySubzone.Name,
++			registrylabel.LabelHostname,
++		},
++		Enabled: &wrappers.BoolValue{Value: true},
++	}
+ 	cases := []struct {
+-		name     string
+-		mesh     *networking.LocalityLoadBalancerSetting
+-		dr       *networking.LocalityLoadBalancerSetting
+-		svc      *model.Service
+-		expected *networking.LocalityLoadBalancerSetting
++		name              string
++		meshLocality      *networking.LocalityLoadBalancerSetting
++		meshZoneAware     *networking.ZoneAwareLoadBalancerSetting
++		dr                *networking.LoadBalancerSettings
++		svc               *model.Service
++		expectedLocality  *networking.LocalityLoadBalancerSetting
++		expectedZoneAware *networking.ZoneAwareLoadBalancerSetting
++		expectedForce     bool
+ 	}{
+ 		{
+-			"all disabled",
+-			nil,
+-			nil,
+-			nil,
+-			nil,
++			name: "all disabled",
+ 		},
+ 		{
+-			"mesh only",
+-			&networking.LocalityLoadBalancerSetting{},
+-			nil,
+-			nil,
+-			&networking.LocalityLoadBalancerSetting{},
++			name:             "mesh locality only",
++			meshLocality:     &networking.LocalityLoadBalancerSetting{},
++			expectedLocality: &networking.LocalityLoadBalancerSetting{},
+ 		},
+ 		{
+-			"dr only",
+-			nil,
+-			&networking.LocalityLoadBalancerSetting{},
+-			nil,
+-			&networking.LocalityLoadBalancerSetting{},
++			name:             "dr locality only",
++			dr:               drLB(&networking.LocalityLoadBalancerSetting{}),
++			expectedLocality: &networking.LocalityLoadBalancerSetting{},
+ 		},
+ 		{
+-			"dr only override",
+-			nil,
+-			&networking.LocalityLoadBalancerSetting{Enabled: &wrappers.BoolValue{Value: true}},
+-			nil,
+-			&networking.LocalityLoadBalancerSetting{Enabled: &wrappers.BoolValue{Value: true}},
++			name:             "dr locality only override",
++			dr:               drLB(&networking.LocalityLoadBalancerSetting{Enabled: &wrappers.BoolValue{Value: true}}),
++			expectedLocality: &networking.LocalityLoadBalancerSetting{Enabled: &wrappers.BoolValue{Value: true}},
+ 		},
+ 		{
+-			"dr and mesh",
+-			&networking.LocalityLoadBalancerSetting{},
+-			&networking.LocalityLoadBalancerSetting{Failover: failover},
+-			nil,
+-			&networking.LocalityLoadBalancerSetting{Failover: failover},
++			name:             "dr locality wins over mesh locality",
++			meshLocality:     &networking.LocalityLoadBalancerSetting{},
++			dr:               drLB(&networking.LocalityLoadBalancerSetting{Failover: failover}),
++			expectedLocality: &networking.LocalityLoadBalancerSetting{Failover: failover},
+ 		},
+ 		{
+-			"prefer close service and mesh",
+-			&networking.LocalityLoadBalancerSetting{},
+-			nil,
+-			preferSameZoneService,
+-			&networking.LocalityLoadBalancerSetting{
+-				FailoverPriority: []string{
+-					label.TopologyNetwork.Name,
+-					registrylabel.LabelTopologyRegion,
+-					registrylabel.LabelTopologyZone,
+-				},
+-				Enabled: &wrappers.BoolValue{Value: true},
+-			},
++			name:             "prefer same zone service over mesh locality",
++			meshLocality:     &networking.LocalityLoadBalancerSetting{},
++			svc:              preferSameZoneService,
++			expectedLocality: preferSameZoneExpected,
++			expectedForce:    true,
+ 		},
+ 		{
+-			"prefer same zone service and mesh",
+-			&networking.LocalityLoadBalancerSetting{},
+-			nil,
+-			preferSameZoneService,
+-			&networking.LocalityLoadBalancerSetting{
+-				FailoverPriority: []string{
+-					label.TopologyNetwork.Name,
+-					registrylabel.LabelTopologyRegion,
+-					registrylabel.LabelTopologyZone,
+-				},
+-				Enabled: &wrappers.BoolValue{Value: true},
+-			},
++			name:             "prefer same node service over mesh locality",
++			meshLocality:     &networking.LocalityLoadBalancerSetting{},
++			svc:              preferSameNodeService,
++			expectedLocality: preferSameNodeExpected,
++			expectedForce:    true,
+ 		},
+ 		{
+-			"prefer same node service and mesh",
+-			&networking.LocalityLoadBalancerSetting{},
+-			nil,
+-			preferSameNodeService,
+-			&networking.LocalityLoadBalancerSetting{
+-				FailoverPriority: []string{
+-					label.TopologyNetwork.Name,
+-					registrylabel.LabelTopologyRegion,
+-					registrylabel.LabelTopologyZone,
+-					label.TopologySubzone.Name,
+-					registrylabel.LabelHostname,
+-				},
++			name:         "mesh locality disabled",
++			meshLocality: &networking.LocalityLoadBalancerSetting{Enabled: &wrappers.BoolValue{Value: false}},
++		},
++		{
++			name:         "dr locality disabled overrides mesh locality enabled",
++			meshLocality: &networking.LocalityLoadBalancerSetting{Enabled: &wrappers.BoolValue{Value: true}},
++			dr:           drLB(&networking.LocalityLoadBalancerSetting{Enabled: &wrappers.BoolValue{Value: false}}),
++		},
++		{
++			name:             "dr locality enabled overrides mesh locality disabled",
++			meshLocality:     &networking.LocalityLoadBalancerSetting{Enabled: &wrappers.BoolValue{Value: false}},
++			dr:               drLB(&networking.LocalityLoadBalancerSetting{Enabled: &wrappers.BoolValue{Value: true}}),
++			expectedLocality: &networking.LocalityLoadBalancerSetting{Enabled: &wrappers.BoolValue{Value: true}},
++		},
++
++		// ZoneAware scenarios
++		{
++			name:              "mesh zone-aware only",
++			meshZoneAware:     &networking.ZoneAwareLoadBalancerSetting{},
++			expectedZoneAware: &networking.ZoneAwareLoadBalancerSetting{},
++			expectedForce:     true,
++		},
++		{
++			name:              "dr zone-aware only",
++			dr:                drZA(&networking.ZoneAwareLoadBalancerSetting{Failover: zaFailover}),
++			expectedZoneAware: &networking.ZoneAwareLoadBalancerSetting{Failover: zaFailover},
++			expectedForce:     true,
++		},
++		{
++			name:              "dr zone-aware wins over mesh zone-aware",
++			meshZoneAware:     &networking.ZoneAwareLoadBalancerSetting{},
++			dr:                drZA(&networking.ZoneAwareLoadBalancerSetting{Failover: zaFailover}),
++			expectedZoneAware: &networking.ZoneAwareLoadBalancerSetting{Failover: zaFailover},
++			expectedForce:     true,
++		},
++		{
++			name:              "dr zone-aware wins over mesh locality",
++			meshLocality:      &networking.LocalityLoadBalancerSetting{Failover: failover},
++			dr:                drZA(&networking.ZoneAwareLoadBalancerSetting{}),
++			expectedZoneAware: &networking.ZoneAwareLoadBalancerSetting{},
++			expectedForce:     true,
++		},
++		{
++			name:             "dr locality wins over mesh zone-aware",
++			meshZoneAware:    &networking.ZoneAwareLoadBalancerSetting{},
++			dr:               drLB(&networking.LocalityLoadBalancerSetting{Failover: failover}),
++			expectedLocality: &networking.LocalityLoadBalancerSetting{Failover: failover},
++		},
++		{
++			name:              "mesh zone-aware wins over mesh locality when both set",
++			meshLocality:      &networking.LocalityLoadBalancerSetting{},
++			meshZoneAware:     &networking.ZoneAwareLoadBalancerSetting{Failover: zaFailover},
++			expectedZoneAware: &networking.ZoneAwareLoadBalancerSetting{Failover: zaFailover},
++			expectedForce:     true,
++		},
++		{
++			name:          "mesh zone-aware disabled",
++			meshZoneAware: &networking.ZoneAwareLoadBalancerSetting{Enabled: &wrappers.BoolValue{Value: false}},
++		},
++		{
++			name:         "dr zone-aware disabled overrides mesh locality enabled",
++			meshLocality: &networking.LocalityLoadBalancerSetting{Enabled: &wrappers.BoolValue{Value: true}},
++			dr:           drZA(&networking.ZoneAwareLoadBalancerSetting{Enabled: &wrappers.BoolValue{Value: false}}),
++		},
++		{
++			name:          "dr zone-aware enabled overrides mesh zone-aware disabled",
++			meshZoneAware: &networking.ZoneAwareLoadBalancerSetting{Enabled: &wrappers.BoolValue{Value: false}},
++			dr:            drZA(&networking.ZoneAwareLoadBalancerSetting{Enabled: &wrappers.BoolValue{Value: true}}),
++			expectedZoneAware: &networking.ZoneAwareLoadBalancerSetting{
+ 				Enabled: &wrappers.BoolValue{Value: true},
+ 			},
++			expectedForce: true,
+ 		},
+ 		{
+-			"mesh disabled",
+-			&networking.LocalityLoadBalancerSetting{Enabled: &wrappers.BoolValue{Value: false}},
+-			nil,
+-			nil,
+-			nil,
++			name:             "service traffic distribution wins over mesh zone-aware",
++			meshZoneAware:    &networking.ZoneAwareLoadBalancerSetting{},
++			svc:              preferSameZoneService,
++			expectedLocality: preferSameZoneExpected,
++			expectedForce:    true,
+ 		},
+ 		{
+-			"dr disabled",
+-			&networking.LocalityLoadBalancerSetting{Enabled: &wrappers.BoolValue{Value: true}},
+-			&networking.LocalityLoadBalancerSetting{Enabled: &wrappers.BoolValue{Value: false}},
+-			nil,
+-			nil,
++			name:              "dr zone-aware wins over service traffic distribution",
++			dr:                drZA(&networking.ZoneAwareLoadBalancerSetting{}),
++			svc:               preferSameZoneService,
++			expectedZoneAware: &networking.ZoneAwareLoadBalancerSetting{},
++			expectedForce:     true,
+ 		},
+ 		{
+-			"dr enabled override mesh disabled",
+-			&networking.LocalityLoadBalancerSetting{Enabled: &wrappers.BoolValue{Value: false}},
+-			&networking.LocalityLoadBalancerSetting{Enabled: &wrappers.BoolValue{Value: true}},
+-			nil,
+-			&networking.LocalityLoadBalancerSetting{Enabled: &wrappers.BoolValue{Value: true}},
++			name:             "dr locality wins over service traffic distribution",
++			dr:               drLB(&networking.LocalityLoadBalancerSetting{Failover: failover}),
++			svc:              preferSameZoneService,
++			expectedLocality: &networking.LocalityLoadBalancerSetting{Failover: failover},
+ 		},
+ 	}
+ 	for _, tt := range cases {
+ 		t.Run(tt.name, func(t *testing.T) {
+-			got, _ := GetLocalityLbSetting(tt.mesh, tt.dr, tt.svc)
+-			if !reflect.DeepEqual(tt.expected, got) {
+-				t.Fatalf("Expected: %v, got: %v", tt.expected, got)
++			got := GetEffectiveLbSetting(tt.meshLocality, tt.meshZoneAware, tt.dr, tt.svc)
++			var (
++				gotLocality  *networking.LocalityLoadBalancerSetting
++				gotZoneAware *networking.ZoneAwareLoadBalancerSetting
++				gotForce     bool
++			)
++			switch s := got.(type) {
++			case LocalityLBSettings:
++				gotLocality, gotForce = s.Setting, s.ForceFailover()
++			case ZoneAwareLBSettings:
++				gotZoneAware, gotForce = s.Setting, s.ForceFailover()
++			}
++			if !reflect.DeepEqual(tt.expectedLocality, gotLocality) {
++				t.Fatalf("locality: expected %v, got %v", tt.expectedLocality, gotLocality)
++			}
++			if !reflect.DeepEqual(tt.expectedZoneAware, gotZoneAware) {
++				t.Fatalf("zone-aware: expected %v, got %v", tt.expectedZoneAware, gotZoneAware)
++			}
++			if tt.expectedForce != gotForce {
++				t.Fatalf("forceFailover: expected %v, got %v", tt.expectedForce, gotForce)
+ 			}
+ 		})
+ 	}
+ }
+ 
++func TestApplyZoneAwareLoadBalancer(t *testing.T) {
++	proxyLocality := &core.Locality{Region: "region1", Zone: "zone1", SubZone: "subzone1"}
++	// fakeCluster has localities region1/zone1/subzone{1,2,3}, region1/zone2, region2, region3.
++	// Envoy zone-aware LB operates only inside one priority level, so when no failover is
++	// configured all LocalityLbEndpoints must remain flat at priority 0.
++
++	t.Run("zone-aware without explicit failover still region-buckets", func(t *testing.T) {
++		c := buildFakeCluster()
++		za := &networking.ZoneAwareLoadBalancerSetting{Enabled: wrappers.Bool(true)}
++		ApplyZoneAwareLoadBalancer(c.LoadAssignment, nil, proxyLocality, nil, za)
++		// Default behavior mirrors locality LB: same-region endpoints at p0, others compacted to p1,
++		// so Envoy zone-aware LB only balances zones inside the proxy's region.
++		want := []uint32{0, 0, 0, 0, 0, 1, 1}
++		for i, ep := range c.LoadAssignment.Endpoints {
++			if ep.Priority != want[i] {
++				t.Errorf("endpoint[%d] locality %v: got priority %d, want %d",
++					i, ep.Locality, ep.Priority, want[i])
++			}
++		}
++	})
++
++	t.Run("zone-aware Failover keeps same-region endpoints at priority 0", func(t *testing.T) {
++		c := buildFakeCluster()
++		za := &networking.ZoneAwareLoadBalancerSetting{
++			Failover: []*networking.ZoneAwareLoadBalancerSetting_Failover{{From: "region1", To: "region2"}},
++		}
++		ApplyZoneAwareLoadBalancer(c.LoadAssignment, nil, proxyLocality, nil, za)
++		// All region1 endpoints (any zone/subzone) → 0, failover-matched region2 → 1, region3 → 2.
++		// This is the shape Envoy zone-aware LB needs: priority 0 spans every same-region zone.
++		want := []uint32{0, 0, 0, 0, 0, 1, 2}
++		for i, ep := range c.LoadAssignment.Endpoints {
++			if ep.Priority != want[i] {
++				t.Errorf("endpoint[%d] locality %v: got priority %d, want %d",
++					i, ep.Locality, ep.Priority, want[i])
++			}
++		}
++	})
++
++	t.Run("zone-aware Failover with no matching rule compacts to two priorities", func(t *testing.T) {
++		c := buildFakeCluster()
++		// No failover rule applies for proxy region1 — all non-r1 endpoints collapse to one bucket.
++		za := &networking.ZoneAwareLoadBalancerSetting{
++			Failover: []*networking.ZoneAwareLoadBalancerSetting_Failover{{From: "region9", To: "region2"}},
++		}
++		ApplyZoneAwareLoadBalancer(c.LoadAssignment, nil, proxyLocality, nil, za)
++		// region1 → 0, region2 + region3 → compacted to 1.
++		want := []uint32{0, 0, 0, 0, 0, 1, 1}
++		for i, ep := range c.LoadAssignment.Endpoints {
++			if ep.Priority != want[i] {
++				t.Errorf("endpoint[%d] locality %v: got priority %d, want %d",
++					i, ep.Locality, ep.Priority, want[i])
++			}
++		}
++	})
++
++	t.Run("zone-aware FailoverPriority delegates to label-based priority", func(t *testing.T) {
++		c := buildSmallClusterForFailOverPriority()
++		wrapped := buildWrappedLocalityLbEndpoints()
++		za := &networking.ZoneAwareLoadBalancerSetting{
++			FailoverPriority: []string{"topology.istio.io/network", "topology.istio.io/cluster"},
++		}
++		proxyLabels := map[string]string{
++			"topology.istio.io/network": "n1",
++			"topology.istio.io/cluster": "c1",
++		}
++		ApplyZoneAwareLoadBalancer(c.LoadAssignment, wrapped, proxyLocality, proxyLabels, za)
++		// applyFailoverPriorities reshapes Endpoints. We just confirm the slice is non-empty
++		// and the priority math ran (some endpoint at priority 0).
++		if len(c.LoadAssignment.Endpoints) == 0 {
++			t.Fatal("expected non-empty endpoints after FailoverPriority")
++		}
++		foundP0 := false
++		for _, ep := range c.LoadAssignment.Endpoints {
++			if ep.Priority == 0 {
++				foundP0 = true
++				break
++			}
++		}
++		if !foundP0 {
++			t.Fatal("expected at least one priority-0 endpoint after FailoverPriority")
++		}
++	})
++
++	t.Run("nil CLA is a no-op", func(t *testing.T) {
++		za := &networking.ZoneAwareLoadBalancerSetting{Enabled: wrappers.Bool(true)}
++		ApplyZoneAwareLoadBalancer(nil, nil, proxyLocality, nil, za)
++	})
++}
++
+ func buildEnvForClustersWithDistribute(t *testing.T, distribute []*networking.LocalityLoadBalancerSetting_Distribute) *model.Environment {
+ 	serviceDiscovery := memregistry.NewServiceDiscovery(&model.Service{
+ 		Hostname:       "test.example.org",
+diff --git a/pilot/pkg/networking/util/util.go b/pilot/pkg/networking/util/util.go
+index 3c09f4c9e2c..50d4a66a529 100644
+--- a/pilot/pkg/networking/util/util.go
++++ b/pilot/pkg/networking/util/util.go
+@@ -81,6 +81,13 @@ const (
+ 	// Inbound pass through cluster need to the bind the loopback ip address for the security and loop avoidance.
+ 	InboundPassthroughCluster = "InboundPassthroughCluster"
+ 
++	// SelfDiscoveryCluster is the self-discovery static cluster injected into the Envoy bootstrap when
++	// ISTIO_META_ENABLE_SELF_DISCOVERY is set. It mirrors the proxy's own service endpoints within
++	// its region and is referenced as cluster_manager.local_cluster_name so Envoy can compute the
++	// per-zone host distribution used by zone-aware load balancing. This value must stay in sync with
++	// the "local_cluster" name hardcoded in the envoy bootstrap template.
++	SelfDiscoveryCluster = "local_cluster"
++
+ 	// IstioMetadataKey is the key under which metadata is added to a route or cluster
+ 	// regarding the virtual service or destination rule used for each
+ 	IstioMetadataKey = "istio"
+diff --git a/pilot/pkg/xds/eds.go b/pilot/pkg/xds/eds.go
+index a6c93dec009..67b58b29ca3 100644
+--- a/pilot/pkg/xds/eds.go
++++ b/pilot/pkg/xds/eds.go
+@@ -22,6 +22,7 @@ import (
+ 
+ 	"istio.io/istio/pilot/pkg/features"
+ 	"istio.io/istio/pilot/pkg/model"
++	"istio.io/istio/pilot/pkg/networking/util"
+ 	"istio.io/istio/pilot/pkg/util/protoconv"
+ 	"istio.io/istio/pilot/pkg/xds/endpoints"
+ 	"istio.io/istio/pkg/config/host"
+@@ -206,25 +207,32 @@ func (eds *EdsGenerator) buildEndpoints(proxy *model.Proxy,
+ 	regenerated := 0
+ 
+ 	for clusterName := range w.ResourceNames {
+-		affectedService := edsUpdatedServices.Contains(model.ParseSubsetKeyHostname(clusterName))
++		affected := affectedService(proxy, edsUpdatedServices, clusterName)
+ 		if partialPush && changedDrs.IsEmpty() && changedAuthnNs.IsEmpty() &&
+-			!affectedService {
++			!affected {
+ 
+ 			// Cluster was not updated and no changes to destination rules or peer authentication policies, skip recomputing.
+ 			continue
+ 		}
+ 
+-		dir, subsetName, hostname, port := model.ParseSubsetKey(clusterName)
++		dir, subsetName, hostname, port := parseClusterName(clusterName, proxy)
+ 		svc := req.Push.ServiceForHostname(proxy, hostname)
+ 
++		isSelfDiscoveryCluster := clusterName == util.SelfDiscoveryCluster
+ 		var dr *model.ConsolidatedDestRule
+-		if svc != nil {
++		if svc != nil && !isSelfDiscoveryCluster {
++			// disable DR lookup for self discovery cluster, we don't need to apply subsetting or traffic policies.
+ 			dr = proxy.SidecarScope.DestinationRule(model.TrafficDirectionOutbound, proxy, svc.Hostname)
+ 		}
+ 
+ 		// if we can do a partial push, check if the cluster is affected by the changed destination rules or peer authentication policies
+ 		// to avoid recomputing the cluster if it is not affected
+-		if partialPush && svc != nil && !affectedService {
++		if partialPush && svc != nil && !affected {
++			// local cluster is unaffected by authn or DR changes
++			if isSelfDiscoveryCluster {
++				continue
++			}
++
+ 			if !clusterAffectedByChangedAuthn(svc, changedAuthnNs, req.Push.Mesh.RootNamespace) &&
+ 				!clusterAffectedByChangedDrs(proxy, dr, hostname, changedDrs) {
+ 				continue
+@@ -262,6 +270,34 @@ func (eds *EdsGenerator) buildEndpoints(proxy *model.Proxy,
+ 	}
+ }
+ 
++func parseClusterName(clusterName string, proxy *model.Proxy) (model.TrafficDirection, string, host.Name, int) {
++	if clusterName == util.SelfDiscoveryCluster {
++		if proxy.LocalService.Name == "" {
++			return model.TrafficDirectionOutbound, "", "", 0
++		}
++
++		return model.TrafficDirectionOutbound, "", host.Name(proxy.LocalService.Name), proxy.LocalService.Port
++	}
++
++	return model.ParseSubsetKey(clusterName)
++}
++
++func affectedService(proxy *model.Proxy, edsUpdatedServices sets.Set[string], clusterName string) bool {
++	if clusterName == util.SelfDiscoveryCluster {
++		// Detect a local-service transition (add, delete, or replace). Both fields are
++		// empty for proxies that never had a local service, so steady-state pushes for
++		// those proxies fall through to "no service, nothing to push".
++		if proxy.LocalService != proxy.PrevLocalService {
++			return true
++		}
++		if proxy.LocalService.Name == "" {
++			return false
++		}
++		return edsUpdatedServices.Contains(proxy.LocalService.Name)
++	}
++	return edsUpdatedServices.Contains(model.ParseSubsetKeyHostname(clusterName))
++}
++
+ // clusterAffectedByChangedDrs checks if the service is affected by the changed destination rules
+ func clusterAffectedByChangedDrs(
+ 	proxy *model.Proxy,
+diff --git a/pilot/pkg/xds/eds_test.go b/pilot/pkg/xds/eds_test.go
+index 231dfda85c9..eae880d8c89 100644
+--- a/pilot/pkg/xds/eds_test.go
++++ b/pilot/pkg/xds/eds_test.go
+@@ -31,6 +31,7 @@ import (
+ 
+ 	endpoint "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
+ 	tls "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
++	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
+ 	uatomic "go.uber.org/atomic"
+ 
+ 	"istio.io/istio/pilot/pkg/features"
+@@ -51,6 +52,7 @@ import (
+ 	"istio.io/istio/pkg/test"
+ 	"istio.io/istio/pkg/test/env"
+ 	"istio.io/istio/pkg/test/util/assert"
++	"istio.io/istio/pkg/test/util/retry"
+ 	"istio.io/istio/pkg/util/sets"
+ )
+ 
+@@ -1445,3 +1447,791 @@ func testEdsz(t *testing.T, s *xdsfake.FakeDiscoveryServer, proxyID string) {
+ 		t.Fatal("Mock eds service not found ", statusStr)
+ 	}
+ }
++
++// TestEdsLocalCluster covers the zone-aware-routing local_cluster EDS path:
++//   - The proxy can subscribe to util.SelfDiscoveryCluster and receive a CLA built from
++//     its own service's endpoints, with locality preserved.
++//   - DestinationRule changes for the local service do NOT trigger a recompute of
++//     local_cluster (since the DR is intentionally ignored for it).
++//   - Endpoint changes to the local service DO trigger a recompute.
++func TestEdsLocalCluster(t *testing.T) {
++	const (
++		proxyIP    = "1.1.1.1"
++		siblingIP  = "2.2.2.2"
++		svcNS      = "default"
++		svcName    = "local"
++		svcHost    = "local.default.svc.cluster.local"
++		nodeID     = "sidecar~1.1.1.1~test.default~default.svc.cluster.local"
++		portName   = "http"
++		portNumber = 80
++	)
++
++	s := xdsfake.NewFakeDiscoveryServer(t, xdsfake.FakeOptions{})
++	svc := &model.Service{
++		Hostname: host.Name(svcHost),
++		Ports: model.PortList{{
++			Name:     portName,
++			Port:     portNumber,
++			Protocol: protocol.HTTP,
++		}},
++		Attributes: model.ServiceAttributes{Namespace: svcNS, Name: svcName},
++	}
++	s.MemRegistry.AddService(svc)
++	s.MemRegistry.AddInstance(&model.ServiceInstance{
++		Service:     svc,
++		ServicePort: svc.Ports[0],
++		Endpoint: &model.IstioEndpoint{
++			Addresses:       []string{proxyIP},
++			ServicePortName: portName,
++			EndpointPort:    portNumber,
++			Locality:        model.Locality{Label: "region1/zone1/subzone1"},
++			TLSMode:         model.IstioMutualTLSModeLabel,
++			HealthStatus:    model.Healthy,
++		},
++	})
++	s.MemRegistry.AddInstance(&model.ServiceInstance{
++		Service:     svc,
++		ServicePort: svc.Ports[0],
++		Endpoint: &model.IstioEndpoint{
++			Addresses:       []string{siblingIP},
++			ServicePortName: portName,
++			EndpointPort:    portNumber,
++			Locality:        model.Locality{Label: "region1/zone2/subzone2"},
++			TLSMode:         model.IstioMutualTLSModeLabel,
++			HealthStatus:    model.Healthy,
++		},
++	})
++	s.EnsureSynced(t)
++
++	// Set the proxy locality so filterIstioEndpoint's same-region filter does not
++	// reject endpoints. Both proxyIP (region1/zone1) and siblingIP (region1/zone2) are
++	// in the same region, so both should appear in the local_cluster CLA.
++	ads := s.ConnectADS().
++		WithID(nodeID).
++		WithType(v3.EndpointType).
++		WithMetadata(model.NodeMetadata{
++			Namespace: svcNS,
++			Labels: map[string]string{
++				"topology.kubernetes.io/region": "region1",
++				"topology.kubernetes.io/zone":   "zone1",
++			},
++		})
++	resp := ads.RequestResponseAck(t, &discovery.DiscoveryRequest{
++		TypeUrl:       v3.EndpointType,
++		ResourceNames: []string{util.SelfDiscoveryCluster},
++	})
++
++	t.Run("initial response includes both localities", func(t *testing.T) {
++		if len(resp.Resources) != 1 {
++			t.Fatalf("expected 1 resource, got %d", len(resp.Resources))
++		}
++		cla := &endpoint.ClusterLoadAssignment{}
++		if err := resp.Resources[0].UnmarshalTo(cla); err != nil {
++			t.Fatal(err)
++		}
++		if cla.ClusterName != util.SelfDiscoveryCluster {
++			t.Errorf("cluster name = %q, want %q", cla.ClusterName, util.SelfDiscoveryCluster)
++		}
++		got := map[string]string{}
++		for _, lle := range cla.Endpoints {
++			for _, lbe := range lle.LbEndpoints {
++				addr := lbe.GetEndpoint().GetAddress().GetSocketAddress().GetAddress()
++				got[addr] = lle.Locality.GetZone()
++			}
++		}
++		want := map[string]string{
++			proxyIP:   "zone1",
++			siblingIP: "zone2",
++		}
++		if !reflect.DeepEqual(want, got) {
++			t.Errorf("endpoints = %v, want %v", got, want)
++		}
++	})
++
++	t.Run("DR change does not recompute local_cluster", func(t *testing.T) {
++		s.Discovery.Push(&model.PushRequest{
++			ConfigsUpdated: sets.New(model.ConfigKey{Kind: kind.DestinationRule, Name: "any", Namespace: svcNS}),
++		})
++		// A partial push that doesn't touch local_cluster should not produce a non-empty
++		// response for this proxy (it's only watching local_cluster).
++		ads.ExpectNoResponse(t)
++	})
++
++	t.Run("endpoint change recomputes local_cluster", func(t *testing.T) {
++		s.MemRegistry.AddInstance(&model.ServiceInstance{
++			Service:     svc,
++			ServicePort: svc.Ports[0],
++			Endpoint: &model.IstioEndpoint{
++				Addresses:       []string{"3.3.3.3"},
++				ServicePortName: portName,
++				EndpointPort:    portNumber,
++				Locality:        model.Locality{Label: "region1/zone3/subzone3"},
++				TLSMode:         model.IstioMutualTLSModeLabel,
++				HealthStatus:    model.Healthy,
++			},
++		})
++		updated := ads.ExpectResponse(t)
++		if len(updated.Resources) != 1 {
++			t.Fatalf("expected 1 resource, got %d", len(updated.Resources))
++		}
++		cla := &endpoint.ClusterLoadAssignment{}
++		if err := updated.Resources[0].UnmarshalTo(cla); err != nil {
++			t.Fatal(err)
++		}
++		zones := map[string]bool{}
++		for _, lle := range cla.Endpoints {
++			zones[lle.Locality.GetZone()] = true
++		}
++		if !zones["zone3"] {
++			t.Errorf("expected new zone3 endpoint, got zones %v", zones)
++		}
++	})
++
++	t.Run("unrelated service update does not recompute local_cluster", func(t *testing.T) {
++		// A ServiceEntry update for a service that is not the proxy's local service
++		// must not produce an EDS response for local_cluster.
++		s.Discovery.Push(&model.PushRequest{
++			ConfigsUpdated: sets.New(model.ConfigKey{
++				Kind:      kind.ServiceEntry,
++				Name:      "other.default.svc.cluster.local",
++				Namespace: svcNS,
++			}),
++		})
++		ads.ExpectNoResponse(t)
++	})
++
++	t.Run("endpoint removal shrinks local_cluster", func(t *testing.T) {
++		// Drop the 3.3.3.3 endpoint added by the previous subtest, leaving only
++		// the proxy's own endpoint and the original sibling.
++		s.MemRegistry.SetEndpoints(svcHost, svcNS, []*model.IstioEndpoint{
++			{
++				Addresses:       []string{proxyIP},
++				ServicePortName: portName,
++				EndpointPort:    portNumber,
++				Locality:        model.Locality{Label: "region1/zone1/subzone1"},
++				TLSMode:         model.IstioMutualTLSModeLabel,
++				HealthStatus:    model.Healthy,
++			},
++			{
++				Addresses:       []string{siblingIP},
++				ServicePortName: portName,
++				EndpointPort:    portNumber,
++				Locality:        model.Locality{Label: "region1/zone2/subzone2"},
++				TLSMode:         model.IstioMutualTLSModeLabel,
++				HealthStatus:    model.Healthy,
++			},
++		})
++		updated := ads.ExpectResponse(t)
++		cla := &endpoint.ClusterLoadAssignment{}
++		if err := updated.Resources[0].UnmarshalTo(cla); err != nil {
++			t.Fatal(err)
++		}
++		addrs := map[string]bool{}
++		for _, lle := range cla.Endpoints {
++			for _, lbe := range lle.LbEndpoints {
++				addrs[lbe.GetEndpoint().GetAddress().GetSocketAddress().GetAddress()] = true
++			}
++		}
++		want := map[string]bool{proxyIP: true, siblingIP: true}
++		if !reflect.DeepEqual(addrs, want) {
++			t.Errorf("CLA endpoints = %v, want %v", addrs, want)
++		}
++	})
++
++	t.Run("cross-region endpoint excluded from local_cluster", func(t *testing.T) {
++		// Add an endpoint for the same service in a different region. It must not
++		// appear in local_cluster because the same-region filter in filterIstioEndpoint
++		// keeps cross-region endpoints out of the zone-aware LB's source cluster.
++		const remoteIP = "4.4.4.4"
++		s.MemRegistry.AddInstance(&model.ServiceInstance{
++			Service:     svc,
++			ServicePort: svc.Ports[0],
++			Endpoint: &model.IstioEndpoint{
++				Addresses:       []string{remoteIP},
++				ServicePortName: portName,
++				EndpointPort:    portNumber,
++				Locality:        model.Locality{Label: "otherregion/zone1/subzone1"},
++				TLSMode:         model.IstioMutualTLSModeLabel,
++				HealthStatus:    model.Healthy,
++			},
++		})
++		updated := ads.ExpectResponse(t)
++		cla := &endpoint.ClusterLoadAssignment{}
++		if err := updated.Resources[0].UnmarshalTo(cla); err != nil {
++			t.Fatal(err)
++		}
++		for _, lle := range cla.Endpoints {
++			for _, lbe := range lle.LbEndpoints {
++				addr := lbe.GetEndpoint().GetAddress().GetSocketAddress().GetAddress()
++				if addr == remoteIP {
++					t.Errorf("cross-region endpoint %s should be excluded from local_cluster, but was present", remoteIP)
++				}
++			}
++		}
++	})
++}
++
++// TestEdsLocalClusterHashFilter verifies that filterIstioEndpoint restricts the
++// local_cluster CLA to endpoints whose pod-template-hash / rollouts-pod-template-hash
++// labels match the calling proxy's labels when those labels are present.
++func TestEdsLocalClusterHashFilter(t *testing.T) {
++	const (
++		proxyIP    = "1.1.1.1"
++		otherIP    = "2.2.2.2"
++		svcNS      = "default"
++		svcHost    = "local.default.svc.cluster.local"
++		nodeID     = "sidecar~1.1.1.1~test.default~default.svc.cluster.local"
++		portName   = "http"
++		portNumber = 80
++		proxyHash  = "abc123"
++		otherHash  = "xyz789"
++	)
++
++	// topoLabels are always needed: the region filter runs before the hash filter.
++	topoLabels := map[string]string{
++		"topology.kubernetes.io/region": "region1",
++		"topology.kubernetes.io/zone":   "zone1",
++	}
++
++	mkEp := func(addr string, extraLabels map[string]string) *model.IstioEndpoint {
++		lbls := map[string]string{}
++		for k, v := range extraLabels {
++			lbls[k] = v
++		}
++		return &model.IstioEndpoint{
++			Addresses:       []string{addr},
++			ServicePortName: portName,
++			EndpointPort:    portNumber,
++			Locality:        model.Locality{Label: "region1/zone1/subzone1"},
++			TLSMode:         model.IstioMutualTLSModeLabel,
++			HealthStatus:    model.Healthy,
++			Labels:          lbls,
++		}
++	}
++
++	withHash := func(base map[string]string, extra map[string]string) map[string]string {
++		out := map[string]string{}
++		for k, v := range base {
++			out[k] = v
++		}
++		for k, v := range extra {
++			out[k] = v
++		}
++		return out
++	}
++
++	cases := []struct {
++		name        string
++		proxyLabels map[string]string
++		endpoints   []*model.IstioEndpoint
++		wantAddrs   map[string]bool
++	}{
++		{
++			name:        "pod-template-hash: matching endpoint included",
++			proxyLabels: withHash(topoLabels, map[string]string{"pod-template-hash": proxyHash}),
++			endpoints: []*model.IstioEndpoint{
++				mkEp(proxyIP, map[string]string{"pod-template-hash": proxyHash}),
++			},
++			wantAddrs: map[string]bool{proxyIP: true},
++		},
++		{
++			name:        "pod-template-hash: mismatched endpoint excluded",
++			proxyLabels: withHash(topoLabels, map[string]string{"pod-template-hash": proxyHash}),
++			endpoints: []*model.IstioEndpoint{
++				mkEp(proxyIP, map[string]string{"pod-template-hash": proxyHash}),
++				mkEp(otherIP, map[string]string{"pod-template-hash": otherHash}),
++			},
++			wantAddrs: map[string]bool{proxyIP: true},
++		},
++		{
++			name:        "pod-template-hash: endpoint without label excluded when proxy has hash",
++			proxyLabels: withHash(topoLabels, map[string]string{"pod-template-hash": proxyHash}),
++			endpoints: []*model.IstioEndpoint{
++				mkEp(proxyIP, map[string]string{"pod-template-hash": proxyHash}),
++				mkEp(otherIP, nil),
++			},
++			wantAddrs: map[string]bool{proxyIP: true},
++		},
++		{
++			// When the proxy has no pod-template-hash label the filter is not applied
++			// and all same-region endpoints appear in the CLA regardless of their labels.
++			name:        "pod-template-hash: no hash on proxy passes all same-region endpoints",
++			proxyLabels: topoLabels,
++			endpoints: []*model.IstioEndpoint{
++				mkEp(proxyIP, nil),
++				mkEp(otherIP, nil),
++			},
++			wantAddrs: map[string]bool{proxyIP: true, otherIP: true},
++		},
++		{
++			name:        "rollouts-pod-template-hash: matching endpoint included, mismatched excluded",
++			proxyLabels: withHash(topoLabels, map[string]string{"rollouts-pod-template-hash": proxyHash}),
++			endpoints: []*model.IstioEndpoint{
++				mkEp(proxyIP, map[string]string{"rollouts-pod-template-hash": proxyHash}),
++				mkEp(otherIP, map[string]string{"rollouts-pod-template-hash": otherHash}),
++			},
++			wantAddrs: map[string]bool{proxyIP: true},
++		},
++		{
++			name:        "rollouts-pod-template-hash: endpoint without label excluded when proxy has hash",
++			proxyLabels: withHash(topoLabels, map[string]string{"rollouts-pod-template-hash": proxyHash}),
++			endpoints: []*model.IstioEndpoint{
++				mkEp(proxyIP, map[string]string{"rollouts-pod-template-hash": proxyHash}),
++				mkEp(otherIP, nil),
++			},
++			wantAddrs: map[string]bool{proxyIP: true},
++		},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			s := xdsfake.NewFakeDiscoveryServer(t, xdsfake.FakeOptions{})
++			svc := &model.Service{
++				Hostname: host.Name(svcHost),
++				Ports: model.PortList{{
++					Name:     portName,
++					Port:     portNumber,
++					Protocol: protocol.HTTP,
++				}},
++				Attributes: model.ServiceAttributes{Namespace: svcNS, Name: "local"},
++			}
++			s.MemRegistry.AddService(svc)
++			for _, ep := range tc.endpoints {
++				s.MemRegistry.AddInstance(&model.ServiceInstance{
++					Service:     svc,
++					ServicePort: svc.Ports[0],
++					Endpoint:    ep,
++				})
++			}
++			s.EnsureSynced(t)
++
++			ads := s.ConnectADS().
++				WithID(nodeID).
++				WithType(v3.EndpointType).
++				WithMetadata(model.NodeMetadata{
++					Namespace: svcNS,
++					Labels:    tc.proxyLabels,
++				})
++			resp := ads.RequestResponseAck(t, &discovery.DiscoveryRequest{
++				TypeUrl:       v3.EndpointType,
++				ResourceNames: []string{util.SelfDiscoveryCluster},
++			})
++
++			if len(resp.Resources) != 1 {
++				t.Fatalf("expected 1 resource, got %d", len(resp.Resources))
++			}
++			cla := &endpoint.ClusterLoadAssignment{}
++			if err := resp.Resources[0].UnmarshalTo(cla); err != nil {
++				t.Fatal(err)
++			}
++			got := map[string]bool{}
++			for _, lle := range cla.Endpoints {
++				for _, lbe := range lle.LbEndpoints {
++					got[lbe.GetEndpoint().GetAddress().GetSocketAddress().GetAddress()] = true
++				}
++			}
++			if !reflect.DeepEqual(tc.wantAddrs, got) {
++				t.Errorf("CLA addresses = %v, want %v", got, tc.wantAddrs)
++			}
++		})
++	}
++}
++
++// TestEdsLocalClusterNoService verifies that a proxy with no ServiceTargets that
++// subscribes to local_cluster receives an empty CLA (cluster name set, no endpoints)
++// rather than a missing resource or a panic.
++func TestEdsLocalClusterNoService(t *testing.T) {
++	s := xdsfake.NewFakeDiscoveryServer(t, xdsfake.FakeOptions{})
++	// Note: no service or instance registered for the proxy's IP, so the proxy will
++	// have no ServiceTargets and local_cluster has no underlying service to resolve.
++	s.EnsureSynced(t)
++
++	ads := s.ConnectADS().
++		WithID("sidecar~9.9.9.9~test.default~default.svc.cluster.local").
++		WithType(v3.EndpointType)
++	resp := ads.RequestResponseAck(t, &discovery.DiscoveryRequest{
++		TypeUrl:       v3.EndpointType,
++		ResourceNames: []string{util.SelfDiscoveryCluster},
++	})
++
++	if len(resp.Resources) != 1 {
++		t.Fatalf("expected 1 resource, got %d", len(resp.Resources))
++	}
++	cla := &endpoint.ClusterLoadAssignment{}
++	if err := resp.Resources[0].UnmarshalTo(cla); err != nil {
++		t.Fatal(err)
++	}
++	if cla.ClusterName != util.SelfDiscoveryCluster {
++		t.Errorf("cluster name = %q, want %q", cla.ClusterName, util.SelfDiscoveryCluster)
++	}
++	if len(cla.Endpoints) != 0 {
++		t.Errorf("expected empty endpoints, got %d locality groups", len(cla.Endpoints))
++	}
++}
++
++// TestEdsLocalClusterSteadyStateNoService verifies that for a proxy that never has
++// a local service, subsequent unrelated service updates do NOT trigger a new
++// local_cluster push. The initial empty CLA is delivered once, and after that the
++// PrevLocalService==LocalService==\"\" sync inside buildEndpoints should keep the
++// transition flag clear so the partial-push optimization kicks in.
++func TestEdsLocalClusterSteadyStateNoService(t *testing.T) {
++	s := xdsfake.NewFakeDiscoveryServer(t, xdsfake.FakeOptions{})
++	s.EnsureSynced(t)
++
++	ads := s.ConnectADS().
++		WithID("sidecar~9.9.9.9~test.default~default.svc.cluster.local").
++		WithType(v3.EndpointType).
++		WithMetadata(model.NodeMetadata{Namespace: "default"})
++	// Consume the initial empty-CLA response so the connection is in steady state.
++	_ = ads.RequestResponseAck(t, &discovery.DiscoveryRequest{
++		TypeUrl:       v3.EndpointType,
++		ResourceNames: []string{util.SelfDiscoveryCluster},
++	})
++
++	// An unrelated ServiceEntry update in the proxy's namespace must not produce
++	// a follow-up local_cluster push.
++	s.Discovery.Push(&model.PushRequest{
++		ConfigsUpdated: sets.New(model.ConfigKey{
++			Kind:      kind.ServiceEntry,
++			Name:      "other.default.svc.cluster.local",
++			Namespace: "default",
++		}),
++	})
++	ads.ExpectNoResponse(t)
++}
++
++// TestEdsLocalClusterServiceReplacement verifies that when the proxy's local service
++// is swapped for a service with a different hostname, the transition is detected
++// (LocalService != PrevLocalService) and local_cluster is recomputed from the new
++// service's endpoints — even on a partial push.
++func TestEdsLocalClusterServiceReplacement(t *testing.T) {
++	const (
++		proxyIP    = "1.1.1.1"
++		svcNS      = "default"
++		nodeID     = "sidecar~1.1.1.1~test.default~default.svc.cluster.local"
++		portName   = "http"
++		portNumber = 80
++		hostA      = "a.default.svc.cluster.local"
++		hostB      = "b.default.svc.cluster.local"
++	)
++
++	s := xdsfake.NewFakeDiscoveryServer(t, xdsfake.FakeOptions{})
++
++	mkSvc := func(hostname, name string) *model.Service {
++		return &model.Service{
++			Hostname: host.Name(hostname),
++			Ports: model.PortList{{
++				Name:     portName,
++				Port:     portNumber,
++				Protocol: protocol.HTTP,
++			}},
++			Attributes: model.ServiceAttributes{Namespace: svcNS, Name: name},
++		}
++	}
++	mkInstance := func(svc *model.Service, zone string) *model.ServiceInstance {
++		return &model.ServiceInstance{
++			Service:     svc,
++			ServicePort: svc.Ports[0],
++			Endpoint: &model.IstioEndpoint{
++				Addresses:       []string{proxyIP},
++				ServicePortName: portName,
++				EndpointPort:    portNumber,
++				Locality:        model.Locality{Label: zone},
++				TLSMode:         model.IstioMutualTLSModeLabel,
++				HealthStatus:    model.Healthy,
++			},
++		}
++	}
++
++	svcA := mkSvc(hostA, "a")
++	s.MemRegistry.AddService(svcA)
++	s.MemRegistry.AddInstance(mkInstance(svcA, "region1/zoneA/sub"))
++	s.EnsureSynced(t)
++
++	ads := s.ConnectADS().
++		WithID(nodeID).
++		WithType(v3.EndpointType).
++		WithMetadata(model.NodeMetadata{
++			Namespace: svcNS,
++			Labels: map[string]string{
++				"topology.kubernetes.io/region": "region1",
++				"topology.kubernetes.io/zone":   "zoneA",
++			},
++		}).
++		WithTimeout(200 * time.Millisecond)
++	// Initial state: proxy belongs to svcA. The initial CLA should carry zoneA.
++	initial := ads.RequestResponseAck(t, &discovery.DiscoveryRequest{
++		TypeUrl:       v3.EndpointType,
++		ResourceNames: []string{util.SelfDiscoveryCluster},
++	})
++	{
++		cla := &endpoint.ClusterLoadAssignment{}
++		if err := initial.Resources[0].UnmarshalTo(cla); err != nil {
++			t.Fatal(err)
++		}
++		zones := map[string]bool{}
++		for _, lle := range cla.Endpoints {
++			zones[lle.Locality.GetZone()] = true
++		}
++		if !zones["zoneA"] {
++			t.Fatalf("initial CLA should contain zoneA, got %v", zones)
++		}
++	}
++
++	// Swap: remove svcA and add svcB (different hostname) where the proxy's IP is
++	// also an endpoint. After SetServiceTargets, proxy.LocalService becomes hostB
++	// while PrevLocalService is still hostA, so the transition forces a recompute.
++	s.MemRegistry.RemoveService(host.Name(hostA))
++	svcB := mkSvc(hostB, "b")
++	s.MemRegistry.AddService(svcB)
++	s.MemRegistry.AddInstance(mkInstance(svcB, "region1/zoneB/sub"))
++
++	// Read responses until we see the CLA reflect svcB's endpoints. Multiple
++	// debounced pushes may arrive (one for the removal, one or more for the add).
++	retry.UntilSuccessOrFail(t, func() error {
++		return test.Wrap(func(w test.Failer) {
++			resp := ads.ExpectResponse(w)
++			cla := &endpoint.ClusterLoadAssignment{}
++			if err := resp.Resources[0].UnmarshalTo(cla); err != nil {
++				w.Fatal(err)
++			}
++			zones := map[string]bool{}
++			for _, lle := range cla.Endpoints {
++				zones[lle.Locality.GetZone()] = true
++			}
++			if !zones["zoneB"] || zones["zoneA"] {
++				w.Fatalf("CLA zones = %v, want zoneB only", zones)
++			}
++		})
++	}, retry.Timeout(3*time.Second), retry.Delay(10*time.Millisecond))
++}
++
++// TestEdsLocalClusterServiceLifecycle verifies that local_cluster reacts to the
++// proxy's local service appearing and disappearing at runtime:
++//   - Initial response with no service is an empty CLA.
++//   - When the service and a matching endpoint are added, local_cluster is pushed
++//     with the new endpoint.
++//   - When the service is removed, local_cluster is pushed again as an empty CLA.
++func TestEdsLocalClusterServiceLifecycle(t *testing.T) {
++	const (
++		proxyIP    = "1.1.1.1"
++		svcNS      = "default"
++		svcName    = "local"
++		svcHost    = "local.default.svc.cluster.local"
++		nodeID     = "sidecar~1.1.1.1~test.default~default.svc.cluster.local"
++		portName   = "http"
++		portNumber = 80
++	)
++
++	s := xdsfake.NewFakeDiscoveryServer(t, xdsfake.FakeOptions{})
++	s.EnsureSynced(t)
++
++	ads := s.ConnectADS().
++		WithID(nodeID).
++		WithType(v3.EndpointType).
++		WithMetadata(model.NodeMetadata{
++			Namespace: svcNS,
++			Labels: map[string]string{
++				"topology.kubernetes.io/region": "region1",
++				"topology.kubernetes.io/zone":   "zone1",
++			},
++		}).
++		WithTimeout(200 * time.Millisecond)
++	initial := ads.RequestResponseAck(t, &discovery.DiscoveryRequest{
++		TypeUrl:       v3.EndpointType,
++		ResourceNames: []string{util.SelfDiscoveryCluster},
++	})
++
++	extractAddrs := func(t *testing.T, resp *discovery.DiscoveryResponse) map[string]bool {
++		t.Helper()
++		if len(resp.Resources) != 1 {
++			t.Fatalf("expected 1 resource, got %d", len(resp.Resources))
++		}
++		cla := &endpoint.ClusterLoadAssignment{}
++		if err := resp.Resources[0].UnmarshalTo(cla); err != nil {
++			t.Fatal(err)
++		}
++		if cla.ClusterName != util.SelfDiscoveryCluster {
++			t.Errorf("cluster name = %q, want %q", cla.ClusterName, util.SelfDiscoveryCluster)
++		}
++		got := map[string]bool{}
++		for _, lle := range cla.Endpoints {
++			for _, lbe := range lle.LbEndpoints {
++				got[lbe.GetEndpoint().GetAddress().GetSocketAddress().GetAddress()] = true
++			}
++		}
++		return got
++	}
++
++	assertLocalCLA := func(t *testing.T, resp *discovery.DiscoveryResponse, wantAddrs ...string) {
++		t.Helper()
++		got := extractAddrs(t, resp)
++		if len(got) != len(wantAddrs) {
++			t.Fatalf("CLA endpoints = %v, want %v", got, wantAddrs)
++		}
++		for _, a := range wantAddrs {
++			if !got[a] {
++				t.Errorf("expected address %q in CLA, got %v", a, got)
++			}
++		}
++	}
++
++	// waitForCLAState consumes EDS responses until one matches the expected address
++	// set (or fails after a longer outer deadline). A registry mutation like
++	// AddService+AddInstance often produces multiple debounced pushes; we want to
++	// validate the *final* state, not the first response we happen to grab.
++	waitForCLAState := func(t *testing.T, wantAddrs ...string) {
++		t.Helper()
++		want := map[string]bool{}
++		for _, a := range wantAddrs {
++			want[a] = true
++		}
++		retry.UntilSuccessOrFail(t, func() error {
++			return test.Wrap(func(w test.Failer) {
++				resp := ads.ExpectResponse(w)
++				got := extractAddrs(t, resp)
++				if !reflect.DeepEqual(got, want) {
++					w.Fatalf("CLA endpoints = %v, want %v", got, want)
++				}
++			})
++		}, retry.Timeout(3*time.Second), retry.Delay(10*time.Millisecond))
++	}
++
++	t.Run("no service yields empty CLA", func(t *testing.T) {
++		assertLocalCLA(t, initial)
++	})
++
++	svc := &model.Service{
++		Hostname: host.Name(svcHost),
++		Ports: model.PortList{{
++			Name:     portName,
++			Port:     portNumber,
++			Protocol: protocol.HTTP,
++		}},
++		Attributes: model.ServiceAttributes{Namespace: svcNS, Name: svcName},
++	}
++
++	t.Run("adding service populates CLA", func(t *testing.T) {
++		s.MemRegistry.AddService(svc)
++		s.MemRegistry.AddInstance(&model.ServiceInstance{
++			Service:     svc,
++			ServicePort: svc.Ports[0],
++			Endpoint: &model.IstioEndpoint{
++				Addresses:       []string{proxyIP},
++				ServicePortName: portName,
++				EndpointPort:    portNumber,
++				Locality:        model.Locality{Label: "region1/zone1/subzone1"},
++				TLSMode:         model.IstioMutualTLSModeLabel,
++				HealthStatus:    model.Healthy,
++			},
++		})
++		waitForCLAState(t, proxyIP)
++	})
++
++	t.Run("removing service yields empty CLA", func(t *testing.T) {
++		s.MemRegistry.RemoveService(host.Name(svcHost))
++		waitForCLAState(t)
++	})
++}
++
++// TestEdsZoneAwareDestinationRule verifies the end-to-end EDS flow for a service that
++// has a DestinationRule with ZoneAwareLbSetting + outlier detection. The resulting CLA
++// must be region-bucketed: every same-region locality at priority 0 (regardless of
++// zone/subzone), failover-matched region at priority 1, remaining regions compacted
++// past that.
++func TestEdsZoneAwareDestinationRule(t *testing.T) {
++	const (
++		svcHost      = "zoneaware.cluster.local"
++		clusterName  = "outbound|80||zoneaware.cluster.local"
++		proxyAddress = "10.10.10.10"
++	)
++	drYAML := `
++apiVersion: networking.istio.io/v1
++kind: DestinationRule
++metadata:
++  name: zone-aware
++  namespace: default
++spec:
++  host: zoneaware.cluster.local
++  trafficPolicy:
++    outlierDetection:
++      interval: 1s
++      baseEjectionTime: 3m
++      maxEjectionPercent: 100
++    loadBalancer:
++      zoneAwareLbSetting:
++        enabled: true
++        failover:
++        - from: region1
++          to: region2
++`
++	s := xdsfake.NewFakeDiscoveryServer(t, xdsfake.FakeOptions{ConfigString: drYAML})
++
++	svc := &model.Service{
++		Hostname:       host.Name(svcHost),
++		DefaultAddress: "10.0.0.1",
++		Ports: model.PortList{{
++			Name:     "http",
++			Port:     80,
++			Protocol: protocol.HTTP,
++		}},
++		Attributes: model.ServiceAttributes{Namespace: "default", Name: "zoneaware"},
++	}
++	s.MemRegistry.AddService(svc)
++
++	// Endpoints span three regions; within region1 we add two zones to confirm both
++	// land at priority 0 even though only one matches the proxy's full locality.
++	endpoints := []struct {
++		ip       string
++		locality string
++	}{
++		{"10.0.1.1", "region1/zone1/subzone1"},
++		{"10.0.1.2", "region1/zone2/subzone1"},
++		{"10.0.2.1", "region2/zone1/subzone1"},
++		{"10.0.3.1", "region3/zone1/subzone1"},
++	}
++	for _, e := range endpoints {
++		s.MemRegistry.AddInstance(&model.ServiceInstance{
++			Service:     svc,
++			ServicePort: svc.Ports[0],
++			Endpoint: &model.IstioEndpoint{
++				Addresses:       []string{e.ip},
++				ServicePortName: "http",
++				EndpointPort:    80,
++				Locality:        model.Locality{Label: e.locality},
++				TLSMode:         model.IstioMutualTLSModeLabel,
++				HealthStatus:    model.Healthy,
++			},
++		})
++	}
++	s.EnsureSynced(t)
++
++	adscConn := s.Connect(
++		&model.Proxy{Locality: util.ConvertLocality(asdcLocality), IPAddresses: []string{proxyAddress}},
++		nil, watchAll,
++	)
++	cla := adscConn.GetEndpoints()[clusterName]
++	if cla == nil {
++		clusters := make([]string, 0, len(adscConn.GetEndpoints()))
++		for k := range adscConn.GetEndpoints() {
++			clusters = append(clusters, k)
++		}
++		t.Fatalf("no CLA for %s; got clusters %v", clusterName, clusters)
++	}
++	// Map each endpoint IP to its priority for stable assertions.
++	gotPriority := map[string]uint32{}
++	for _, lle := range cla.GetEndpoints() {
++		for _, lbe := range lle.LbEndpoints {
++			gotPriority[lbe.GetEndpoint().GetAddress().GetSocketAddress().GetAddress()] = lle.Priority
++		}
++	}
++	want := map[string]uint32{
++		"10.0.1.1": 0, // region1/zone1/subzone1 (proxy locality)
++		"10.0.1.2": 0, // region1, different zone — still p0 under zone-aware
++		"10.0.2.1": 1, // region2 - failover To
++		"10.0.3.1": 2, // region3 - failover unmatched
++	}
++	if !reflect.DeepEqual(want, gotPriority) {
++		t.Errorf("CLA priorities = %v, want %v", gotPriority, want)
++	}
++}
+diff --git a/pilot/pkg/xds/endpoints/endpoint_builder.go b/pilot/pkg/xds/endpoints/endpoint_builder.go
+index 993315edeed..2bff6ef648f 100644
+--- a/pilot/pkg/xds/endpoints/endpoint_builder.go
++++ b/pilot/pkg/xds/endpoints/endpoint_builder.go
+@@ -88,6 +88,7 @@ type EndpointBuilder struct {
+ 	mtlsChecker *mtlsChecker
+ 
+ 	canonicalServiceForMeshExternal bool
++	isSelfDiscoveryCluster          bool
+ }
+ 
+ func NewEndpointBuilder(clusterName string, proxy *model.Proxy, push *model.PushContext) EndpointBuilder {
+@@ -132,6 +133,7 @@ func NewCDSEndpointBuilder(
+ 		dir:        dir,
+ 
+ 		canonicalServiceForMeshExternal: features.CanonicalServiceForMeshExternalServiceEntry,
++		isSelfDiscoveryCluster:          clusterName == util.SelfDiscoveryCluster,
+ 	}
+ 	b.populateSubsetInfo()
+ 	b.populateFailoverPriorityLabels()
+@@ -174,13 +176,26 @@ func (b *EndpointBuilder) populateSubsetInfo() {
+ }
+ 
+ func (b *EndpointBuilder) populateFailoverPriorityLabels() {
++	if b.isSelfDiscoveryCluster {
++		return
++	}
++
+ 	enableFailover, lb := getOutlierDetectionAndLoadBalancerSettings(b.DestinationRule(), b.port, b.subsetName)
+-	if enableFailover {
+-		lbSetting, _ := loadbalancer.GetLocalityLbSetting(b.push.Mesh.GetLocalityLbSetting(), lb.GetLocalityLbSetting(), b.service)
+-		if lbSetting != nil && lbSetting.Distribute == nil &&
+-			len(lbSetting.FailoverPriority) > 0 && (lbSetting.Enabled == nil || lbSetting.Enabled.Value) {
+-			b.failoverPriorityLabels = util.GetFailoverPriorityLabels(b.proxy.Labels, lbSetting.FailoverPriority)
+-		}
++	if !enableFailover {
++		return
++	}
++	lbSettings := loadbalancer.GetEffectiveLbSetting(
++		b.push.Mesh.GetLocalityLbSetting(),
++		b.push.Mesh.GetZoneAwareLbSetting(),
++		lb,
++		b.service,
++	)
++	if lbSettings == nil {
++		return
++	}
++	failoverPriority := lbSettings.FailoverPriorityLabels()
++	if len(failoverPriority) > 0 {
++		b.failoverPriorityLabels = util.GetFailoverPriorityLabels(b.proxy.Labels, failoverPriority)
+ 	}
+ }
+ 
+@@ -279,6 +294,17 @@ func (b *EndpointBuilder) WriteHash(h hash.Hash) {
+ 		h.WriteString(b.proxyView.String())
+ 	}
+ 	h.Write(Separator)
++
++	if b.isSelfDiscoveryCluster {
++		h.WriteString(b.proxy.Metadata.WorkloadName)
++		h.Write(Separator)
++		h.WriteString(b.proxy.Labels["pod-template-hash"])
++		h.Write(Separator)
++		h.WriteString(b.proxy.Labels["rollouts-pod-template-hash"])
++		h.Write(Separator)
++		h.WriteString(strconv.Itoa(b.port))
++		h.Write(Separator)
++	}
+ }
+ 
+ func (b *EndpointBuilder) Cacheable() bool {
+@@ -418,6 +444,10 @@ func (b *EndpointBuilder) BuildClusterLoadAssignment(endpointIndex *model.Endpoi
+ 	}
+ 
+ 	l := b.createClusterLoadAssignment(localityLbEndpoints)
++	// if this is the self-discovery cluster we can and should avoid applying loadbalancers
++	if b.isSelfDiscoveryCluster {
++		return l
++	}
+ 
+ 	// If locality aware routing is enabled, prioritize endpoints or set their lb weight.
+ 	// Failover should only be enabled when there is an outlier detection, otherwise Envoy
+@@ -426,20 +456,31 @@ func (b *EndpointBuilder) BuildClusterLoadAssignment(endpointIndex *model.Endpoi
+ 	// outlier detection in a DestinationRule will automatically activate locality LB failover
+ 	// even when no explicit localityLbSetting is configured in the DR.
+ 	enableFailover, lb := getOutlierDetectionAndLoadBalancerSettings(b.DestinationRule(), b.port, b.subsetName)
+-	lbSetting, forceFailover := loadbalancer.GetLocalityLbSetting(b.push.Mesh.GetLocalityLbSetting(), lb.GetLocalityLbSetting(), b.service)
+-	enableFailover = enableFailover || forceFailover
+-	if lbSetting != nil {
+-		// Make a shallow copy of the cla as we are mutating the endpoints with priorities/weights relative to the calling proxy
+-		l = util.CloneClusterLoadAssignment(l)
+-		wrappedLocalityLbEndpoints := make([]*loadbalancer.WrappedLocalityLbEndpoints, len(localityLbEndpoints))
+-		for i := range localityLbEndpoints {
+-			wrappedLocalityLbEndpoints[i] = &loadbalancer.WrappedLocalityLbEndpoints{
+-				IstioEndpoints:      localityLbEndpoints[i].istioEndpoints,
+-				LocalityLbEndpoints: l.Endpoints[i],
+-			}
++	lbSettings := loadbalancer.GetEffectiveLbSetting(
++		b.push.Mesh.GetLocalityLbSetting(),
++		b.push.Mesh.GetZoneAwareLbSetting(),
++		lb,
++		b.service,
++	)
++	if lbSettings == nil {
++		return l
++	}
++	// Zone-aware LB relies on a self-discovery local_cluster, which waypoints never configure,
++	// so it is meaningless there. Skip it for waypoints (they fall back to locality LB only if
++	// one is configured, but the two settings are mutually exclusive so there is none here).
++	if lbSettings.IsZoneAware() && b.proxy.Type == model.Waypoint {
++		return l
++	}
++	// Make a shallow copy of the cla as we are mutating the endpoints with priorities/weights relative to the calling proxy
++	l = util.CloneClusterLoadAssignment(l)
++	wrappedLocalityLbEndpoints := make([]*loadbalancer.WrappedLocalityLbEndpoints, len(localityLbEndpoints))
++	for i := range localityLbEndpoints {
++		wrappedLocalityLbEndpoints[i] = &loadbalancer.WrappedLocalityLbEndpoints{
++			IstioEndpoints:      localityLbEndpoints[i].istioEndpoints,
++			LocalityLbEndpoints: l.Endpoints[i],
+ 		}
+-		loadbalancer.ApplyLocalityLoadBalancer(l, wrappedLocalityLbEndpoints, b.locality, b.proxy.Labels, lbSetting, enableFailover)
+ 	}
++	lbSettings.ApplyToLoadAssignment(l, wrappedLocalityLbEndpoints, b.locality, b.proxy.Labels, enableFailover)
+ 	return l
+ }
+ 
+@@ -552,7 +593,6 @@ func (b *EndpointBuilder) filterIstioEndpoint(ep *model.IstioEndpoint) bool {
+ 	}
+ 	// Filter out unhealthy endpoints, unless the service needs them.
+ 	// This is used to let envoy know about the amount of health endpoints in a cluster.
+-	// This is used to let envoy know about the amount of health endpoints in a cluster.
+ 	if !b.service.SupportsUnhealthyEndpoints() && ep.HealthStatus == model.UnHealthy {
+ 		return false
+ 	}
+@@ -578,6 +618,28 @@ func (b *EndpointBuilder) filterIstioEndpoint(ep *model.IstioEndpoint) bool {
+ 		return false
+ 	}
+ 
++	// If this is the self discovery cluster, then we only need endpoints from the same workload and the same region.
++	if b.isSelfDiscoveryCluster {
++		if b.proxy.Metadata.WorkloadName != ep.WorkloadName {
++			return false
++		}
++
++		// In kubernetes it's better if we only include endpoints from the same ReplicaSet,
++		// since we can expect balanced traffic distribution across the pods in the same ReplicaSet,
++		// but not across multiple ReplicaSets in a Deployment.
++		if b.proxy.Labels["pod-template-hash"] != ep.Labels["pod-template-hash"] {
++			return false
++		}
++		if b.proxy.Labels["rollouts-pod-template-hash"] != ep.Labels["rollouts-pod-template-hash"] {
++			return false
++		}
++
++		locality := util.ConvertLocality(ep.Locality.Label)
++		if b.locality != nil && b.locality.Region != locality.Region {
++			return false
++		}
++	}
++
+ 	return true
+ }
+ 
+diff --git a/pilot/pkg/xds/proxy_dependencies.go b/pilot/pkg/xds/proxy_dependencies.go
+index 0fe6cba9656..f6c74338799 100644
+--- a/pilot/pkg/xds/proxy_dependencies.go
++++ b/pilot/pkg/xds/proxy_dependencies.go
+@@ -44,10 +44,20 @@ func filterRelevantUpdates(proxy *model.Proxy, req *model.PushRequest) *model.Pu
+ 	for config := range req.ConfigsUpdated {
+ 		if proxyDependentOnConfig(proxy, config, req.Push) {
+ 			relevantUpdates.Insert(config)
+-		} else {
+-			// we have filtered out a config
+-			changed = true
++			continue
+ 		}
++		// if proxy enables self-discovery, we need to always include LocalService related configs.
++		// we can avoid this elsewhere to avoid unnecessary proxy pushes.
++		if proxy.Metadata.EnableSelfDiscovery && (config.Kind == kind.ServiceEntry || config.Kind == kind.Endpoints) {
++			if (config.Name == proxy.PrevLocalService.Name && config.Namespace == proxy.PrevLocalService.Namespace) ||
++				(config.Name == proxy.LocalService.Name && config.Namespace == proxy.LocalService.Namespace) {
++				relevantUpdates.Insert(config)
++				continue
++			}
++		}
++
++		// we have filtered out a config
++		changed = true
+ 	}
+ 
+ 	// If the proxy's service updated, need push for it.
+diff --git a/pilot/pkg/xds/proxy_dependencies_test.go b/pilot/pkg/xds/proxy_dependencies_test.go
+index dfc7d8b60be..1dba82f2201 100644
+--- a/pilot/pkg/xds/proxy_dependencies_test.go
++++ b/pilot/pkg/xds/proxy_dependencies_test.go
+@@ -530,6 +530,146 @@ func TestProxyNeedsPush(t *testing.T) {
+ 	}
+ }
+ 
++// TestProxyNeedsPushServiceTargets verifies how updates for the proxy's own service
++// (LocalService / ServiceTargets) and its previous local service (PrevLocalService) are
++// filtered when those services are not part of the proxy's egress (sidecar) scope.
++//
++// ServiceEntry updates for the current ServiceTargets are always kept (pre-existing
++// inbound behavior). Endpoints updates for the local/previous-local service, and any
++// PrevLocalService update, are only kept when the proxy has self-discovery enabled — this
++// is what keeps the zone-aware local_cluster in sync as the proxy's own endpoints change.
++func TestProxyNeedsPushServiceTargets(t *testing.T) {
++	const (
++		ownSvc   = "own.ns1.svc.cluster.local"
++		prevSvc  = "prev.ns1.svc.cluster.local"
++		otherSvc = "other.ns1.svc.cluster.local"
++		ns       = "ns1"
++		otherNs  = "ns2"
++		nsRoot   = "rootns"
++	)
++
++	cg := core.NewConfigGenTest(t, core.TestOptions{})
++	cg.PushContext().Mesh.RootNamespace = nsRoot
++
++	// A sidecar whose egress scope does NOT include its own service, so DependsOnConfig
++	// alone would filter out ServiceEntry/Endpoints updates for it. Only the
++	// ServiceTargets / LocalService / PrevLocalService handling in filterRelevantUpdates
++	// re-adds them. LocalService mirrors ServiceTargets[0], as SetServiceTargets populates it.
++	newSidecar := func(selfDiscovery bool) *model.Proxy {
++		return &model.Proxy{
++			Type:         model.SidecarProxy,
++			IPAddresses:  []string{"127.0.0.1"},
++			Metadata:     &model.NodeMetadata{EnableSelfDiscovery: model.StringBool(selfDiscovery)},
++			SidecarScope: &model.SidecarScope{Name: "sc1", Namespace: ns},
++			ServiceTargets: []model.ServiceTarget{
++				{Service: &model.Service{
++					Hostname:   ownSvc,
++					Attributes: model.ServiceAttributes{Namespace: ns},
++				}},
++			},
++			LocalService:     model.LocalServiceInfo{Name: ownSvc, Namespace: ns},
++			PrevLocalService: model.LocalServiceInfo{Name: prevSvc, Namespace: ns},
++		}
++	}
++
++	key := func(k kind.Kind, name, namespace string) model.ConfigKey {
++		return model.ConfigKey{Kind: k, Name: name, Namespace: namespace}
++	}
++
++	cases := []struct {
++		name          string
++		selfDiscovery bool
++		configs       sets.Set[model.ConfigKey]
++		want          bool
++		wantConfigs   sets.Set[model.ConfigKey]
++	}{
++		// ServiceEntry for the current ServiceTargets is kept regardless of self-discovery.
++		{
++			name:          "service entry for own service kept without self-discovery",
++			selfDiscovery: false,
++			configs:       sets.New(key(kind.ServiceEntry, ownSvc, ns)),
++			want:          true,
++			wantConfigs:   sets.New(key(kind.ServiceEntry, ownSvc, ns)),
++		},
++		// Endpoints for the own service are dropped without self-discovery (out of scope).
++		{
++			name:          "endpoints for own service filtered without self-discovery",
++			selfDiscovery: false,
++			configs:       sets.New(key(kind.Endpoints, ownSvc, ns)),
++			want:          false,
++			wantConfigs:   sets.New[model.ConfigKey](),
++		},
++		// PrevLocalService is only relevant to self-discovery, so it is dropped otherwise.
++		{
++			name:          "previous local service filtered without self-discovery",
++			selfDiscovery: false,
++			configs:       sets.New(key(kind.ServiceEntry, prevSvc, ns), key(kind.Endpoints, prevSvc, ns)),
++			want:          false,
++			wantConfigs:   sets.New[model.ConfigKey](),
++		},
++		// With self-discovery, both ServiceEntry and Endpoints for the local service are kept.
++		{
++			name:          "endpoints for own service kept with self-discovery",
++			selfDiscovery: true,
++			configs:       sets.New(key(kind.Endpoints, ownSvc, ns)),
++			want:          true,
++			wantConfigs:   sets.New(key(kind.Endpoints, ownSvc, ns)),
++		},
++		{
++			name:          "endpoints for previous local service kept with self-discovery",
++			selfDiscovery: true,
++			configs:       sets.New(key(kind.Endpoints, prevSvc, ns)),
++			want:          true,
++			wantConfigs:   sets.New(key(kind.Endpoints, prevSvc, ns)),
++		},
++		{
++			name:          "service entry for previous local service kept with self-discovery",
++			selfDiscovery: true,
++			configs:       sets.New(key(kind.ServiceEntry, prevSvc, ns)),
++			want:          true,
++			wantConfigs:   sets.New(key(kind.ServiceEntry, prevSvc, ns)),
++		},
++		// Unrelated out-of-scope services are filtered even with self-discovery enabled.
++		{
++			name:          "endpoints for unrelated out-of-scope service filtered with self-discovery",
++			selfDiscovery: true,
++			configs:       sets.New(key(kind.Endpoints, otherSvc, ns)),
++			want:          false,
++			wantConfigs:   sets.New[model.ConfigKey](),
++		},
++		// Namespace must match: same name in a different namespace does not match the local service.
++		{
++			name:          "previous local service name but wrong namespace filtered with self-discovery",
++			selfDiscovery: true,
++			configs:       sets.New(key(kind.Endpoints, prevSvc, otherNs)),
++			want:          false,
++			wantConfigs:   sets.New[model.ConfigKey](),
++		},
++		{
++			name:          "mixed: own-service endpoints kept, unrelated endpoints filtered with self-discovery",
++			selfDiscovery: true,
++			configs: sets.New(
++				key(kind.Endpoints, ownSvc, ns),
++				key(kind.Endpoints, otherSvc, ns),
++			),
++			want:        true,
++			wantConfigs: sets.New(key(kind.Endpoints, ownSvc, ns)),
++		},
++	}
++
++	for _, tt := range cases {
++		t.Run(tt.name, func(t *testing.T) {
++			newReq, got := DefaultProxyNeedsPush(newSidecar(tt.selfDiscovery), &model.PushRequest{ConfigsUpdated: tt.configs, Push: cg.PushContext()})
++			if got != tt.want {
++				t.Fatalf("Got needs push = %v, expected %v", got, tt.want)
++			}
++			if !tt.wantConfigs.Equals(newReq.ConfigsUpdated) {
++				t.Fatalf("Got configs updated = %v, expected %v", newReq.ConfigsUpdated, tt.wantConfigs)
++			}
++		})
++	}
++}
++
+ func TestCheckConnectionIdentity(t *testing.T) {
+ 	cases := []struct {
+ 		name      string
+diff --git a/pkg/bootstrap/config.go b/pkg/bootstrap/config.go
+index a7d9dd19943..df9c615af29 100644
+--- a/pkg/bootstrap/config.go
++++ b/pkg/bootstrap/config.go
+@@ -207,6 +207,10 @@ func (cfg Config) toTemplateParams() (map[string]any, error) {
+ 		opts = append(opts, option.EnvoyStatusPortEnableProxyProtocol(true))
+ 	}
+ 
++	if cfg.Metadata.EnableSelfDiscovery {
++		opts = append(opts, option.EnableSelfDiscovery(true))
++	}
++
+ 	proxyOpts, err := getProxyConfigOptions(cfg.Metadata)
+ 	if err != nil {
+ 		return nil, err
+diff --git a/pkg/bootstrap/config_test.go b/pkg/bootstrap/config_test.go
+index d5c8c54ba05..b3a13249a58 100644
+--- a/pkg/bootstrap/config_test.go
++++ b/pkg/bootstrap/config_test.go
+@@ -362,3 +362,38 @@ func TestServiceClusterOrDefault(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestZoneAwareRoutingTemplateParam(t *testing.T) {
++	cases := []struct {
++		name   string
++		envVal string
++		want   bool
++	}{
++		{"disabled", "", false},
++		{"enabled", "true", true},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			envs := os.Environ()
++			if tc.envVal != "" {
++				envs = append(envs, "ISTIO_META_ENABLE_SELF_DISCOVERY="+tc.envVal)
++			}
++			node, err := GetNodeMetaData(MetadataOptions{
++				ID:          "sidecar~1.2.3.4~foo~bar",
++				Envs:        envs,
++				ProxyConfig: &v1alpha1.ProxyConfig{},
++			})
++			if err != nil {
++				t.Fatal(err)
++			}
++			params, err := (Config{Node: node}).toTemplateParams()
++			if err != nil {
++				t.Fatal(err)
++			}
++			got, _ := params["enable_self_discovery"].(bool)
++			if got != tc.want {
++				t.Errorf("enable_self_discovery = %v, want %v", got, tc.want)
++			}
++		})
++	}
++}
+diff --git a/pkg/bootstrap/option/instances.go b/pkg/bootstrap/option/instances.go
+index 4a98ea388e0..f93792b693d 100644
+--- a/pkg/bootstrap/option/instances.go
++++ b/pkg/bootstrap/option/instances.go
+@@ -244,6 +244,10 @@ func EnvoyStatusPortEnableProxyProtocol(value bool) Instance {
+ 	return newOption("envoy_status_port_enable_proxy_protocol", value)
+ }
+ 
++func EnableSelfDiscovery(value bool) Instance {
++	return newOption("enable_self_discovery", value)
++}
++
+ func EnvoyPrometheusPort(value int) Instance {
+ 	return newOption("envoy_prometheus_port", value)
+ }
+diff --git a/pkg/bootstrap/testdata/all_golden.json b/pkg/bootstrap/testdata/all_golden.json
+index 90c98925b88..82a9c4f8172 100644
+--- a/pkg/bootstrap/testdata/all_golden.json
++++ b/pkg/bootstrap/testdata/all_golden.json
+@@ -408,6 +408,7 @@
+         }
+       }
+       
++      
+     ],
+     "listeners":[
+       {
+@@ -647,10 +648,10 @@
+   
+   ,
+   "cluster_manager": {
+-    "enable_deferred_cluster_creation": true,
+     "outlier_detection": {
+       "event_log_path": "/dev/stdout"
+-    }
++    },
++    "enable_deferred_cluster_creation": true
+   }
+   ,
+   "deferred_stat_options": {
+diff --git a/pkg/bootstrap/testdata/ambient_golden.json b/pkg/bootstrap/testdata/ambient_golden.json
+index e3c7e05c026..045d475bcd9 100644
+--- a/pkg/bootstrap/testdata/ambient_golden.json
++++ b/pkg/bootstrap/testdata/ambient_golden.json
+@@ -334,6 +334,7 @@
+       }
+       
+       
++      
+     ],
+     "listeners":[
+       {
+@@ -527,10 +528,10 @@
+   
+   ,
+   "cluster_manager": {
+-    "enable_deferred_cluster_creation": true,
+     "outlier_detection": {
+       "event_log_path": "/dev/stdout"
+-    }
++    },
++    "enable_deferred_cluster_creation": true
+   }
+   ,
+   "deferred_stat_options": {
+diff --git a/pkg/bootstrap/testdata/auth_golden.json b/pkg/bootstrap/testdata/auth_golden.json
+index f054717c739..326e329c87f 100644
+--- a/pkg/bootstrap/testdata/auth_golden.json
++++ b/pkg/bootstrap/testdata/auth_golden.json
+@@ -321,6 +321,7 @@
+       }
+       
+       
++      
+     ],
+     "listeners":[
+       {
+@@ -514,10 +515,10 @@
+   
+   ,
+   "cluster_manager": {
+-    "enable_deferred_cluster_creation": true,
+     "outlier_detection": {
+       "event_log_path": "/dev/stdout"
+-    }
++    },
++    "enable_deferred_cluster_creation": true
+   }
+   ,
+   "deferred_stat_options": {
+diff --git a/pkg/bootstrap/testdata/authsds_golden.json b/pkg/bootstrap/testdata/authsds_golden.json
+index eeac3ada3b3..d92a7fcd1d4 100644
+--- a/pkg/bootstrap/testdata/authsds_golden.json
++++ b/pkg/bootstrap/testdata/authsds_golden.json
+@@ -321,6 +321,7 @@
+       }
+       
+       
++      
+     ],
+     "listeners":[
+       {
+@@ -514,10 +515,10 @@
+   
+   ,
+   "cluster_manager": {
+-    "enable_deferred_cluster_creation": true,
+     "outlier_detection": {
+       "event_log_path": "/dev/stdout"
+-    }
++    },
++    "enable_deferred_cluster_creation": true
+   }
+   ,
+   "deferred_stat_options": {
+diff --git a/pkg/bootstrap/testdata/default_golden.json b/pkg/bootstrap/testdata/default_golden.json
+index 788a0c588e4..9cf25eae436 100644
+--- a/pkg/bootstrap/testdata/default_golden.json
++++ b/pkg/bootstrap/testdata/default_golden.json
+@@ -321,6 +321,7 @@
+       }
+       
+       
++      
+     ],
+     "listeners":[
+       {
+@@ -514,10 +515,10 @@
+   
+   ,
+   "cluster_manager": {
+-    "enable_deferred_cluster_creation": true,
+     "outlier_detection": {
+       "event_log_path": "/dev/stdout"
+-    }
++    },
++    "enable_deferred_cluster_creation": true
+   }
+   ,
+   "deferred_stat_options": {
+diff --git a/pkg/bootstrap/testdata/explicit_internal_address_golden.json b/pkg/bootstrap/testdata/explicit_internal_address_golden.json
+index 24094f62849..433820ad43a 100644
+--- a/pkg/bootstrap/testdata/explicit_internal_address_golden.json
++++ b/pkg/bootstrap/testdata/explicit_internal_address_golden.json
+@@ -321,6 +321,7 @@
+       }
+       
+       
++      
+     ],
+     "listeners":[
+       {
+@@ -514,10 +515,10 @@
+   
+   ,
+   "cluster_manager": {
+-    "enable_deferred_cluster_creation": true,
+     "outlier_detection": {
+       "event_log_path": "/dev/stdout"
+-    }
++    },
++    "enable_deferred_cluster_creation": true
+   }
+   ,
+   "deferred_stat_options": {
+diff --git a/pkg/bootstrap/testdata/global_downstream_max_connections_both_golden.json b/pkg/bootstrap/testdata/global_downstream_max_connections_both_golden.json
+index 88f3d2622a3..02bd359f1c5 100644
+--- a/pkg/bootstrap/testdata/global_downstream_max_connections_both_golden.json
++++ b/pkg/bootstrap/testdata/global_downstream_max_connections_both_golden.json
+@@ -321,6 +321,7 @@
+       }
+       
+       
++      
+     ],
+     "listeners":[
+       {
+@@ -514,10 +515,10 @@
+   
+   ,
+   "cluster_manager": {
+-    "enable_deferred_cluster_creation": true,
+     "outlier_detection": {
+       "event_log_path": "/dev/stdout"
+-    }
++    },
++    "enable_deferred_cluster_creation": true
+   }
+   ,
+   "deferred_stat_options": {
+diff --git a/pkg/bootstrap/testdata/global_downstream_max_connections_meta_golden.json b/pkg/bootstrap/testdata/global_downstream_max_connections_meta_golden.json
+index 80941f4ea03..e8daa36b0f8 100644
+--- a/pkg/bootstrap/testdata/global_downstream_max_connections_meta_golden.json
++++ b/pkg/bootstrap/testdata/global_downstream_max_connections_meta_golden.json
+@@ -321,6 +321,7 @@
+       }
+       
+       
++      
+     ],
+     "listeners":[
+       {
+@@ -514,10 +515,10 @@
+   
+   ,
+   "cluster_manager": {
+-    "enable_deferred_cluster_creation": true,
+     "outlier_detection": {
+       "event_log_path": "/dev/stdout"
+-    }
++    },
++    "enable_deferred_cluster_creation": true
+   }
+   ,
+   "deferred_stat_options": {
+diff --git a/pkg/bootstrap/testdata/global_downstream_max_connections_runtime_golden.json b/pkg/bootstrap/testdata/global_downstream_max_connections_runtime_golden.json
+index f52352888c7..f2f8c9747a9 100644
+--- a/pkg/bootstrap/testdata/global_downstream_max_connections_runtime_golden.json
++++ b/pkg/bootstrap/testdata/global_downstream_max_connections_runtime_golden.json
+@@ -321,6 +321,7 @@
+       }
+       
+       
++      
+     ],
+     "listeners":[
+       {
+@@ -514,10 +515,10 @@
+   
+   ,
+   "cluster_manager": {
+-    "enable_deferred_cluster_creation": true,
+     "outlier_detection": {
+       "event_log_path": "/dev/stdout"
+-    }
++    },
++    "enable_deferred_cluster_creation": true
+   }
+   ,
+   "deferred_stat_options": {
+diff --git a/pkg/bootstrap/testdata/invalid_stats_eviction_interval_golden.json b/pkg/bootstrap/testdata/invalid_stats_eviction_interval_golden.json
+index eb26c2b3245..ca369071967 100644
+--- a/pkg/bootstrap/testdata/invalid_stats_eviction_interval_golden.json
++++ b/pkg/bootstrap/testdata/invalid_stats_eviction_interval_golden.json
+@@ -408,6 +408,7 @@
+         }
+       }
+       
++      
+     ],
+     "listeners":[
+       {
+@@ -647,10 +648,10 @@
+   
+   ,
+   "cluster_manager": {
+-    "enable_deferred_cluster_creation": true,
+     "outlier_detection": {
+       "event_log_path": "/dev/stdout"
+-    }
++    },
++    "enable_deferred_cluster_creation": true
+   }
+   ,
+   "deferred_stat_options": {
+diff --git a/pkg/bootstrap/testdata/lrs_golden.json b/pkg/bootstrap/testdata/lrs_golden.json
+index dbfc11a627d..76bdfc542e5 100644
+--- a/pkg/bootstrap/testdata/lrs_golden.json
++++ b/pkg/bootstrap/testdata/lrs_golden.json
+@@ -321,6 +321,7 @@
+       }
+       
+       
++      
+     ],
+     "listeners":[
+       {
+@@ -514,12 +515,11 @@
+   
+   ,
+   "cluster_manager": {
+-    "enable_deferred_cluster_creation": true,
+     "outlier_detection": {
+       "event_log_path": "/dev/stdout"
+-    }
+-    ,
+-    "load_stats_config":{"api_type": "GRPC", "transport_api_version": "V3"}
++    },
++    "load_stats_config":{"api_type": "GRPC", "transport_api_version": "V3"},
++    "enable_deferred_cluster_creation": true
+   }
+   ,
+   "deferred_stat_options": {
+diff --git a/pkg/bootstrap/testdata/metrics_no_statsd_golden.json b/pkg/bootstrap/testdata/metrics_no_statsd_golden.json
+index 0ee92e688c6..f243f6f2060 100644
+--- a/pkg/bootstrap/testdata/metrics_no_statsd_golden.json
++++ b/pkg/bootstrap/testdata/metrics_no_statsd_golden.json
+@@ -353,6 +353,7 @@
+       }
+       
+       
++      
+     ],
+     "listeners":[
+       {
+@@ -566,10 +567,10 @@
+   
+   ,
+   "cluster_manager": {
+-    "enable_deferred_cluster_creation": true,
+     "outlier_detection": {
+       "event_log_path": "/dev/stdout"
+-    }
++    },
++    "enable_deferred_cluster_creation": true
+   }
+   ,
+   "deferred_stat_options": {
+diff --git a/pkg/bootstrap/testdata/running_golden.json b/pkg/bootstrap/testdata/running_golden.json
+index a891c00d1d6..3d971943cc5 100644
+--- a/pkg/bootstrap/testdata/running_golden.json
++++ b/pkg/bootstrap/testdata/running_golden.json
+@@ -350,6 +350,7 @@
+       }
+       
+       
++      
+     ],
+     "listeners":[
+       {
+@@ -574,10 +575,10 @@
+   
+   ,
+   "cluster_manager": {
+-    "enable_deferred_cluster_creation": true,
+     "outlier_detection": {
+       "event_log_path": "/dev/stdout"
+-    }
++    },
++    "enable_deferred_cluster_creation": true
+   }
+   ,
+   "deferred_stat_options": {
+diff --git a/pkg/bootstrap/testdata/runningsds_golden.json b/pkg/bootstrap/testdata/runningsds_golden.json
+index d9e655688e2..06cdf0b0f88 100644
+--- a/pkg/bootstrap/testdata/runningsds_golden.json
++++ b/pkg/bootstrap/testdata/runningsds_golden.json
+@@ -350,6 +350,7 @@
+       }
+       
+       
++      
+     ],
+     "listeners":[
+       {
+@@ -574,10 +575,10 @@
+   
+   ,
+   "cluster_manager": {
+-    "enable_deferred_cluster_creation": true,
+     "outlier_detection": {
+       "event_log_path": "/dev/stdout"
+-    }
++    },
++    "enable_deferred_cluster_creation": true
+   }
+   ,
+   "deferred_stat_options": {
+diff --git a/pkg/bootstrap/testdata/secure_metrics_golden.json b/pkg/bootstrap/testdata/secure_metrics_golden.json
+index 0472ad2ef2b..4a0ecfdf935 100644
+--- a/pkg/bootstrap/testdata/secure_metrics_golden.json
++++ b/pkg/bootstrap/testdata/secure_metrics_golden.json
+@@ -321,6 +321,7 @@
+       }
+       
+       
++      
+     ],
+     "listeners":[
+       {
+@@ -714,10 +715,10 @@
+   
+   ,
+   "cluster_manager": {
+-    "enable_deferred_cluster_creation": true,
+     "outlier_detection": {
+       "event_log_path": "/dev/stdout"
+-    }
++    },
++    "enable_deferred_cluster_creation": true
+   }
+   ,
+   "deferred_stat_options": {
+diff --git a/pkg/bootstrap/testdata/stats_compression_golden.json b/pkg/bootstrap/testdata/stats_compression_golden.json
+index 9c50a2b8aa6..88569e76f6c 100644
+--- a/pkg/bootstrap/testdata/stats_compression_golden.json
++++ b/pkg/bootstrap/testdata/stats_compression_golden.json
+@@ -321,6 +321,7 @@
+       }
+       
+       
++      
+     ],
+     "listeners":[
+       {
+@@ -448,10 +449,10 @@
+   
+   ,
+   "cluster_manager": {
+-    "enable_deferred_cluster_creation": true,
+     "outlier_detection": {
+       "event_log_path": "/dev/stdout"
+-    }
++    },
++    "enable_deferred_cluster_creation": true
+   }
+   ,
+   "deferred_stat_options": {
+diff --git a/pkg/bootstrap/testdata/stats_eviction_interval_golden.json b/pkg/bootstrap/testdata/stats_eviction_interval_golden.json
+index 07ed5caf38f..0190989870e 100644
+--- a/pkg/bootstrap/testdata/stats_eviction_interval_golden.json
++++ b/pkg/bootstrap/testdata/stats_eviction_interval_golden.json
+@@ -409,6 +409,7 @@
+         }
+       }
+       
++      
+     ],
+     "listeners":[
+       {
+@@ -648,10 +649,10 @@
+   
+   ,
+   "cluster_manager": {
+-    "enable_deferred_cluster_creation": true,
+     "outlier_detection": {
+       "event_log_path": "/dev/stdout"
+-    }
++    },
++    "enable_deferred_cluster_creation": true
+   }
+   ,
+   "deferred_stat_options": {
+diff --git a/pkg/bootstrap/testdata/stats_flush_interval_golden.json b/pkg/bootstrap/testdata/stats_flush_interval_golden.json
+index 2742faa51d8..924e2c79ec6 100644
+--- a/pkg/bootstrap/testdata/stats_flush_interval_golden.json
++++ b/pkg/bootstrap/testdata/stats_flush_interval_golden.json
+@@ -409,6 +409,7 @@
+         }
+       }
+       
++      
+     ],
+     "listeners":[
+       {
+@@ -648,10 +649,10 @@
+   
+   ,
+   "cluster_manager": {
+-    "enable_deferred_cluster_creation": true,
+     "outlier_detection": {
+       "event_log_path": "/dev/stdout"
+-    }
++    },
++    "enable_deferred_cluster_creation": true
+   }
+   ,
+   "deferred_stat_options": {
+diff --git a/pkg/bootstrap/testdata/stats_inclusion_golden.json b/pkg/bootstrap/testdata/stats_inclusion_golden.json
+index d1a4347113f..6920944f6bc 100644
+--- a/pkg/bootstrap/testdata/stats_inclusion_golden.json
++++ b/pkg/bootstrap/testdata/stats_inclusion_golden.json
+@@ -415,6 +415,7 @@
+       }
+       
+       
++      
+     ],
+     "listeners":[
+       {
+@@ -608,10 +609,10 @@
+   
+   ,
+   "cluster_manager": {
+-    "enable_deferred_cluster_creation": true,
+     "outlier_detection": {
+       "event_log_path": "/dev/stdout"
+-    }
++    },
++    "enable_deferred_cluster_creation": true
+   }
+   ,
+   "deferred_stat_options": {
+diff --git a/pkg/bootstrap/testdata/stats_interval_golden.json b/pkg/bootstrap/testdata/stats_interval_golden.json
+index 5b83a93bbaa..fe85f4db584 100644
+--- a/pkg/bootstrap/testdata/stats_interval_golden.json
++++ b/pkg/bootstrap/testdata/stats_interval_golden.json
+@@ -410,6 +410,7 @@
+         }
+       }
+       
++      
+     ],
+     "listeners":[
+       {
+@@ -649,10 +650,10 @@
+   
+   ,
+   "cluster_manager": {
+-    "enable_deferred_cluster_creation": true,
+     "outlier_detection": {
+       "event_log_path": "/dev/stdout"
+-    }
++    },
++    "enable_deferred_cluster_creation": true
+   }
+   ,
+   "deferred_stat_options": {
+diff --git a/pkg/bootstrap/testdata/tracing_datadog_golden.json b/pkg/bootstrap/testdata/tracing_datadog_golden.json
+index 65cf4c36eca..3128af55539 100644
+--- a/pkg/bootstrap/testdata/tracing_datadog_golden.json
++++ b/pkg/bootstrap/testdata/tracing_datadog_golden.json
+@@ -344,6 +344,7 @@
+       }
+       
+       
++      
+     ],
+     "listeners":[
+       {
+@@ -549,10 +550,10 @@
+   
+   ,
+   "cluster_manager": {
+-    "enable_deferred_cluster_creation": true,
+     "outlier_detection": {
+       "event_log_path": "/dev/stdout"
+-    }
++    },
++    "enable_deferred_cluster_creation": true
+   }
+   ,
+   "deferred_stat_options": {
+diff --git a/pkg/bootstrap/testdata/tracing_lightstep_golden.json b/pkg/bootstrap/testdata/tracing_lightstep_golden.json
+index bbdd96798a8..4197c3257bc 100644
+--- a/pkg/bootstrap/testdata/tracing_lightstep_golden.json
++++ b/pkg/bootstrap/testdata/tracing_lightstep_golden.json
+@@ -352,6 +352,7 @@
+       }
+       
+       
++      
+     ],
+     "listeners":[
+       {
+@@ -556,10 +557,10 @@
+   
+   ,
+   "cluster_manager": {
+-    "enable_deferred_cluster_creation": true,
+     "outlier_detection": {
+       "event_log_path": "/dev/stdout"
+-    }
++    },
++    "enable_deferred_cluster_creation": true
+   }
+   ,
+   "deferred_stat_options": {
+diff --git a/pkg/bootstrap/testdata/tracing_none_golden.json b/pkg/bootstrap/testdata/tracing_none_golden.json
+index 579e631b3d1..744eacb9bfe 100644
+--- a/pkg/bootstrap/testdata/tracing_none_golden.json
++++ b/pkg/bootstrap/testdata/tracing_none_golden.json
+@@ -321,6 +321,7 @@
+       }
+       
+       
++      
+     ],
+     "listeners":[
+       {
+@@ -514,10 +515,10 @@
+   
+   ,
+   "cluster_manager": {
+-    "enable_deferred_cluster_creation": true,
+     "outlier_detection": {
+       "event_log_path": "/dev/stdout"
+-    }
++    },
++    "enable_deferred_cluster_creation": true
+   }
+   ,
+   "deferred_stat_options": {
+diff --git a/pkg/bootstrap/testdata/tracing_tls_custom_sni_golden.json b/pkg/bootstrap/testdata/tracing_tls_custom_sni_golden.json
+index d5fa9b18ef2..da7f3e4c1c4 100644
+--- a/pkg/bootstrap/testdata/tracing_tls_custom_sni_golden.json
++++ b/pkg/bootstrap/testdata/tracing_tls_custom_sni_golden.json
+@@ -346,6 +346,7 @@
+       }
+       
+       
++      
+     ],
+     "listeners":[
+       {
+@@ -553,10 +554,10 @@
+   
+   ,
+   "cluster_manager": {
+-    "enable_deferred_cluster_creation": true,
+     "outlier_detection": {
+       "event_log_path": "/dev/stdout"
+-    }
++    },
++    "enable_deferred_cluster_creation": true
+   }
+   ,
+   "deferred_stat_options": {
+diff --git a/pkg/bootstrap/testdata/tracing_tls_golden.json b/pkg/bootstrap/testdata/tracing_tls_golden.json
+index 76a2526cbb9..fc52260b522 100644
+--- a/pkg/bootstrap/testdata/tracing_tls_golden.json
++++ b/pkg/bootstrap/testdata/tracing_tls_golden.json
+@@ -346,6 +346,7 @@
+       }
+       
+       
++      
+     ],
+     "listeners":[
+       {
+@@ -553,10 +554,10 @@
+   
+   ,
+   "cluster_manager": {
+-    "enable_deferred_cluster_creation": true,
+     "outlier_detection": {
+       "event_log_path": "/dev/stdout"
+-    }
++    },
++    "enable_deferred_cluster_creation": true
+   }
+   ,
+   "deferred_stat_options": {
+diff --git a/pkg/bootstrap/testdata/tracing_zipkin_golden.json b/pkg/bootstrap/testdata/tracing_zipkin_golden.json
+index 7a0ab571809..3016b18f690 100644
+--- a/pkg/bootstrap/testdata/tracing_zipkin_golden.json
++++ b/pkg/bootstrap/testdata/tracing_zipkin_golden.json
+@@ -345,6 +345,7 @@
+       }
+       
+       
++      
+     ],
+     "listeners":[
+       {
+@@ -552,10 +553,10 @@
+   
+   ,
+   "cluster_manager": {
+-    "enable_deferred_cluster_creation": true,
+     "outlier_detection": {
+       "event_log_path": "/dev/stdout"
+-    }
++    },
++    "enable_deferred_cluster_creation": true
+   }
+   ,
+   "deferred_stat_options": {
+diff --git a/pkg/bootstrap/testdata/xdsproxy_golden.json b/pkg/bootstrap/testdata/xdsproxy_golden.json
+index c86327e7354..e7d5c886020 100644
+--- a/pkg/bootstrap/testdata/xdsproxy_golden.json
++++ b/pkg/bootstrap/testdata/xdsproxy_golden.json
+@@ -321,6 +321,7 @@
+       }
+       
+       
++      
+     ],
+     "listeners":[
+       {
+@@ -514,10 +515,10 @@
+   
+   ,
+   "cluster_manager": {
+-    "enable_deferred_cluster_creation": true,
+     "outlier_detection": {
+       "event_log_path": "/dev/stdout"
+-    }
++    },
++    "enable_deferred_cluster_creation": true
+   }
+   ,
+   "deferred_stat_options": {
+diff --git a/pkg/config/mesh/mesh_test.go b/pkg/config/mesh/mesh_test.go
+index 404acd4d448..b61cb1bd634 100644
+--- a/pkg/config/mesh/mesh_test.go
++++ b/pkg/config/mesh/mesh_test.go
+@@ -277,6 +277,86 @@ defaultConfig:
+ 	t.Log("Result: \n", gotY, err)
+ }
+ 
++func TestApplyMeshConfigLocalityZoneAware(t *testing.T) {
++	cases := []struct {
++		name           string
++		yaml           string
++		wantLocality   bool
++		wantZoneAware  bool
++		wantZAEnabled  bool
++		wantLocEnabled bool
++	}{
++		{
++			name:           "no override keeps default locality",
++			yaml:           ``,
++			wantLocality:   true,
++			wantLocEnabled: true,
++		},
++		{
++			// LocalityLbSetting and ZoneAwareLbSetting are not mutually exclusive at the
++			// mesh level: the default locality setting is retained alongside the user's
++			// zone-aware setting, and LB resolution gives zone-aware precedence at runtime.
++			name: "user sets zoneAwareLbSetting; default locality retained",
++			yaml: `
++zoneAwareLbSetting:
++  enabled: true
++`,
++			wantLocality:   true,
++			wantLocEnabled: true,
++			wantZoneAware:  true,
++			wantZAEnabled:  true,
++		},
++		{
++			name: "user sets localityLbSetting disabled",
++			yaml: `
++localityLbSetting:
++  enabled: false
++`,
++			wantLocality: true,
++		},
++		{
++			// Both set at the mesh level is allowed; neither is cleared.
++			name: "user sets both is allowed at mesh level",
++			yaml: `
++localityLbSetting:
++  enabled: true
++zoneAwareLbSetting:
++  enabled: true
++`,
++			wantLocality:   true,
++			wantLocEnabled: true,
++			wantZoneAware:  true,
++			wantZAEnabled:  true,
++		},
++	}
++	for _, tt := range cases {
++		t.Run(tt.name, func(t *testing.T) {
++			got, err := mesh.ApplyMeshConfigDefaults(tt.yaml)
++			if err != nil {
++				t.Fatalf("ApplyMeshConfigDefaults() failed: %v", err)
++			}
++			if tt.wantLocality {
++				if got.LocalityLbSetting == nil {
++					t.Errorf("expected LocalityLbSetting set, got nil")
++				} else if tt.wantLocEnabled && !got.LocalityLbSetting.GetEnabled().GetValue() {
++					t.Errorf("expected LocalityLbSetting.Enabled=true")
++				}
++			} else if got.LocalityLbSetting != nil {
++				t.Errorf("expected LocalityLbSetting nil, got %v", got.LocalityLbSetting)
++			}
++			if tt.wantZoneAware {
++				if got.ZoneAwareLbSetting == nil {
++					t.Errorf("expected ZoneAwareLbSetting set, got nil")
++				} else if tt.wantZAEnabled && !got.ZoneAwareLbSetting.GetEnabled().GetValue() {
++					t.Errorf("expected ZoneAwareLbSetting.Enabled=true")
++				}
++			} else if got.ZoneAwareLbSetting != nil {
++				t.Errorf("expected ZoneAwareLbSetting nil, got %v", got.ZoneAwareLbSetting)
++			}
++		})
++	}
++}
++
+ func getExtensionProviders(eps []*meshconfig.MeshConfig_ExtensionProvider) []string {
+ 	got := []string{}
+ 	for _, ep := range eps {
+diff --git a/pkg/config/validation/agent/validation.go b/pkg/config/validation/agent/validation.go
+index 6d2ed2aee1a..9e78fdfeaf3 100644
+--- a/pkg/config/validation/agent/validation.go
++++ b/pkg/config/validation/agent/validation.go
+@@ -588,6 +588,55 @@ func ValidateLocalityLbSetting(lb *networking.LocalityLoadBalancerSetting, outli
+ 	return errs
+ }
+ 
++// ValidateZoneAwareLbSetting checks the ZoneAwareLoadBalancerSetting on a
++// DestinationRule's TrafficPolicy. ZoneAwareLbSetting differs from
++// LocalityLbSetting in that region-, zone-, and subzone-level routing are all
++// handled automatically by Envoy: endpoints are always partitioned by region and
++// zone/subzone routing within a region is implicit. As a result, failover only
++// configures cross-region ordering, and failover_priority must not contain the
++// region, zone, or subzone topology labels.
++func ValidateZoneAwareLbSetting(lb *networking.ZoneAwareLoadBalancerSetting, outlier *networking.OutlierDetection) (errs Validation) {
++	if lb == nil {
++		return errs
++	}
++
++	for _, priorityLabel := range lb.GetFailoverPriority() {
++		// Region-, zone-, and subzone-level routing are all handled automatically by
++		// zone-aware LB: endpoints are always partitioned by region (use `failover` to
++		// order the cross-region tiers) and zone/subzone routing within a region is
++		// implicit. Allowing these topology labels in failover_priority would be
++		// redundant with, or conflict with, the ordering Envoy already applies.
++		switch priorityLabel {
++		case label.LabelTopologyRegion, label.LabelTopologyZone, label.LabelTopologySubzone:
++			errs = AppendValidation(
++				errs,
++				fmt.Errorf(
++					"'failover_priority' for zone aware lb must not use topology label '%s'; region- and zone-level routing are handled automatically",
++					priorityLabel,
++				),
++			)
++		}
++	}
++
++	if (len(lb.GetFailover()) != 0 || len(lb.GetFailoverPriority()) != 0) && outlier == nil {
++		errs = AppendValidation(errs, WrapWarning(fmt.Errorf("outlier detection policy must be provided for failover")))
++	}
++
++	for _, failover := range lb.GetFailover() {
++		if failover.From == failover.To {
++			errs = AppendValidation(errs, fmt.Errorf("zone aware lb failover settings must specify different regions"))
++		}
++		if strings.Contains(failover.From, "/") || strings.Contains(failover.To, "/") {
++			errs = AppendValidation(errs, fmt.Errorf("zone aware lb failover only specifies region; zone and subzone failover are handled automatically"))
++		}
++		if strings.Contains(failover.To, "*") || strings.Contains(failover.From, "*") {
++			errs = AppendValidation(errs, fmt.Errorf("zone aware lb failover region should not contain '*' wildcard"))
++		}
++	}
++
++	return errs
++}
++
+ const (
+ 	regionIndex int = iota
+ 	zoneIndex
+@@ -907,7 +956,14 @@ func ValidateMeshConfig(mesh *meshconfig.MeshConfig) (Warning, error) {
+ 		v = AppendValidation(v, ValidateMeshConfigProxyConfig(mesh.DefaultConfig))
+ 	}
+ 
++	// LocalityLbSetting and ZoneAwareLbSetting are not mutually exclusive at the mesh level:
++	// the default mesh config always enables LocalityLbSetting, and load-balancer resolution
++	// (GetEffectiveLbSetting) gives ZoneAwareLbSetting deterministic precedence over
++	// LocalityLbSetting, so a user opting into mesh-wide zone-aware LB simply has locality LB
++	// ignored. The mutual-exclusion check is still enforced for DestinationRule LoadBalancerSettings,
++	// where specifying both in a single policy is a genuine mistake.
+ 	v = AppendValidation(v, ValidateLocalityLbSetting(mesh.LocalityLbSetting, &networking.OutlierDetection{}))
++	v = AppendValidation(v, ValidateZoneAwareLbSetting(mesh.ZoneAwareLbSetting, &networking.OutlierDetection{}))
+ 	v = AppendValidation(v, validateServiceSettings(mesh))
+ 	v = AppendValidation(v, validateTrustDomainConfig(mesh))
+ 
+diff --git a/pkg/config/validation/agent/validation_test.go b/pkg/config/validation/agent/validation_test.go
+index 24e3dd98a41..8a550085029 100644
+--- a/pkg/config/validation/agent/validation_test.go
++++ b/pkg/config/validation/agent/validation_test.go
+@@ -1425,6 +1425,161 @@ func TestValidateLocalityLbSetting(t *testing.T) {
+ 	}
+ }
+ 
++func TestValidateZoneAwareLbSetting(t *testing.T) {
++	cases := []struct {
++		name    string
++		in      *networking.ZoneAwareLoadBalancerSetting
++		outlier *networking.OutlierDetection
++		err     bool
++		warn    bool
++	}{
++		{
++			name:    "nil setting is valid",
++			in:      nil,
++			outlier: nil,
++		},
++		{
++			name: "enabled only is valid",
++			in: &networking.ZoneAwareLoadBalancerSetting{
++				Enabled: &wrappers.BoolValue{Value: true},
++			},
++			outlier: &networking.OutlierDetection{},
++		},
++		{
++			name: "valid region-level failover",
++			in: &networking.ZoneAwareLoadBalancerSetting{
++				Failover: []*networking.ZoneAwareLoadBalancerSetting_Failover{
++					{From: "us-east", To: "eu-west"},
++				},
++			},
++			outlier: &networking.OutlierDetection{},
++		},
++		{
++			name: "failover same src and dst region",
++			in: &networking.ZoneAwareLoadBalancerSetting{
++				Failover: []*networking.ZoneAwareLoadBalancerSetting_Failover{
++					{From: "region1", To: "region1"},
++				},
++			},
++			outlier: &networking.OutlierDetection{},
++			err:     true,
++		},
++		{
++			name: "failover src has '/' (zone scope) is rejected",
++			in: &networking.ZoneAwareLoadBalancerSetting{
++				Failover: []*networking.ZoneAwareLoadBalancerSetting_Failover{
++					{From: "region1/zone1", To: "region2"},
++				},
++			},
++			outlier: &networking.OutlierDetection{},
++			err:     true,
++		},
++		{
++			name: "failover dst has '/' (zone scope) is rejected",
++			in: &networking.ZoneAwareLoadBalancerSetting{
++				Failover: []*networking.ZoneAwareLoadBalancerSetting_Failover{
++					{From: "region1", To: "region2/zone1"},
++				},
++			},
++			outlier: &networking.OutlierDetection{},
++			err:     true,
++		},
++		{
++			name: "failover src has '*' wildcard is rejected",
++			in: &networking.ZoneAwareLoadBalancerSetting{
++				Failover: []*networking.ZoneAwareLoadBalancerSetting_Failover{
++					{From: "*", To: "region2"},
++				},
++			},
++			outlier: &networking.OutlierDetection{},
++			err:     true,
++		},
++		{
++			name: "failover dst has '*' wildcard is rejected",
++			in: &networking.ZoneAwareLoadBalancerSetting{
++				Failover: []*networking.ZoneAwareLoadBalancerSetting_Failover{
++					{From: "region1", To: "*"},
++				},
++			},
++			outlier: &networking.OutlierDetection{},
++			err:     true,
++		},
++		{
++			name: "failover and failoverPriority both set with topology region",
++			in: &networking.ZoneAwareLoadBalancerSetting{
++				Failover: []*networking.ZoneAwareLoadBalancerSetting_Failover{
++					{From: "region1", To: "region2"},
++				},
++				FailoverPriority: []string{"topology.kubernetes.io/region"},
++			},
++			outlier: &networking.OutlierDetection{},
++			err:     true,
++		},
++		{
++			name: "failoverPriority with region label is rejected",
++			in: &networking.ZoneAwareLoadBalancerSetting{
++				FailoverPriority: []string{"topology.kubernetes.io/region"},
++			},
++			outlier: &networking.OutlierDetection{},
++			err:     true,
++		},
++		{
++			name: "failoverPriority with zone label is rejected",
++			in: &networking.ZoneAwareLoadBalancerSetting{
++				FailoverPriority: []string{"topology.kubernetes.io/zone"},
++			},
++			outlier: &networking.OutlierDetection{},
++			err:     true,
++		},
++		{
++			name: "failoverPriority with subzone label is rejected",
++			in: &networking.ZoneAwareLoadBalancerSetting{
++				FailoverPriority: []string{"topology.istio.io/subzone"},
++			},
++			outlier: &networking.OutlierDetection{},
++			err:     true,
++		},
++		{
++			name: "failoverPriority with non-topology labels is valid",
++			in: &networking.ZoneAwareLoadBalancerSetting{
++				FailoverPriority: []string{"version", "app=ratings"},
++			},
++			outlier: &networking.OutlierDetection{},
++		},
++		{
++			name: "failover without outlier detection warns",
++			in: &networking.ZoneAwareLoadBalancerSetting{
++				Failover: []*networking.ZoneAwareLoadBalancerSetting_Failover{
++					{From: "us-east", To: "eu-west"},
++				},
++			},
++			outlier: nil,
++			warn:    true,
++		},
++		{
++			name: "failoverPriority without outlier detection warns",
++			in: &networking.ZoneAwareLoadBalancerSetting{
++				FailoverPriority: []string{"version"},
++			},
++			outlier: nil,
++			warn:    true,
++		},
++	}
++
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			v := ValidateZoneAwareLbSetting(c.in, c.outlier)
++			warn, err := v.Unwrap()
++			if (err != nil) != c.err {
++				t.Errorf("got err=%v but wanted err=%v: %v", err != nil, c.err, err)
++			}
++			if (warn != nil) != c.warn {
++				t.Errorf("got warn=%v but wanted warn=%v: %v", warn != nil, c.warn, warn)
++			}
++		})
++	}
++}
++
+ func TestValidateLocalities(t *testing.T) {
+ 	cases := []struct {
+ 		name       string
+diff --git a/pkg/config/validation/validation.go b/pkg/config/validation/validation.go
+index c63997f425e..a091cf59da0 100644
+--- a/pkg/config/validation/validation.go
++++ b/pkg/config/validation/validation.go
+@@ -1256,7 +1256,11 @@ func validateLoadBalancer(settings *networking.LoadBalancerSettings, outlier *ne
+ 		}
+ 	}
+ 
++	if settings.LocalityLbSetting != nil && settings.ZoneAwareLbSetting != nil {
++		errs = AppendValidation(errs, fmt.Errorf("only one of localityLbSetting and zoneAwareLbSetting can be set"))
++	}
+ 	errs = AppendValidation(errs, agent.ValidateLocalityLbSetting(settings.LocalityLbSetting, outlier))
++	errs = AppendValidation(errs, agent.ValidateZoneAwareLbSetting(settings.ZoneAwareLbSetting, outlier))
+ 
+ 	if warm := settings.Warmup; warm != nil {
+ 		if warm.Duration == nil {
+diff --git a/pkg/config/validation/validation_test.go b/pkg/config/validation/validation_test.go
+index 0531f6bb486..050131d446b 100644
+--- a/pkg/config/validation/validation_test.go
++++ b/pkg/config/validation/validation_test.go
+@@ -3688,6 +3688,26 @@ func TestValidateLoadBalancer(t *testing.T) {
+ 			},
+ 			valid: false,
+ 		},
++
++		{
++			name: "invalid: localityLbSetting and zoneAwareLbSetting both set",
++			in: &networking.LoadBalancerSettings{
++				LocalityLbSetting:  &networking.LocalityLoadBalancerSetting{},
++				ZoneAwareLbSetting: &networking.ZoneAwareLoadBalancerSetting{},
++			},
++			valid: false,
++		},
++		{
++			name: "valid: zoneAwareLbSetting only",
++			in: &networking.LoadBalancerSettings{
++				ZoneAwareLbSetting: &networking.ZoneAwareLoadBalancerSetting{
++					Failover: []*networking.ZoneAwareLoadBalancerSetting_Failover{
++						{From: "us-east", To: "eu-west"},
++					},
++				},
++			},
++			valid: true,
++		},
+ 	}
+ 
+ 	for _, c := range cases {
+diff --git a/pkg/model/proxy.go b/pkg/model/proxy.go
+index 25769bafce5..36da8f94321 100644
+--- a/pkg/model/proxy.go
++++ b/pkg/model/proxy.go
+@@ -284,6 +284,10 @@ type NodeMetadata struct {
+ 	// Generator indicates the client wants to use a custom Generator plugin.
+ 	Generator string `json:"GENERATOR,omitempty"`
+ 
++	// EnableSelfDiscovery indicates that the proxy should configure a local_cluster static cluster
++	// in its bootstrap for zone-aware load balancing. Set via ISTIO_META_ENABLE_SELF_DISCOVERY.
++	EnableSelfDiscovery StringBool `json:"ENABLE_SELF_DISCOVERY,omitempty"`
++
+ 	// DNSCapture indicates whether the workload has enabled dns capture
+ 	DNSCapture StringBool `json:"DNS_CAPTURE,omitempty"`
+ 
+diff --git a/releasenotes/notes/zone-aware-load-balancing.yaml b/releasenotes/notes/zone-aware-load-balancing.yaml
+new file mode 100644
+index 00000000000..62166e42191
+--- /dev/null
++++ b/releasenotes/notes/zone-aware-load-balancing.yaml
+@@ -0,0 +1,21 @@
++apiVersion: release-notes/v2
++kind: feature
++area: traffic-management
++
++releaseNotes:
++  - |
++    **Added** support for Envoy's zone-aware load balancing via a new `zoneAwareLbSetting` field
++    on `DestinationRule.TrafficPolicy.LoadBalancerSettings` and `MeshConfig`. When enabled, Envoy
++    automatically routes traffic to endpoints in the same availability zone as the downstream proxy,
++    spilling over to other zones only when local capacity is insufficient. This differs from the
++    existing `localityLbSetting` in that zone-level routing is handled automatically
++    by Envoy using the proxy's zone distribution, rather than through static percentages.
++    Cross-region failover ordering can be configured via the `failover` field, and label-based
++    priority tiers can be layered on top via `failoverPriority`. Zone-aware load balancing requires
++    `ISTIO_META_ENABLE_SELF_DISCOVERY: "true"` in `meshConfig.defaultConfig.proxyMetadata` to
++    inject the self-discovery `local_cluster` into sidecar bootstraps. It is not supported in Ambient,
++    only Sidecar mode.
++
++docs:
++  - '[reference] https://istio.io/latest/docs/reference/config/networking/destination-rule/#ZoneAwareLoadBalancerSetting'
++  - '[reference] https://istio.io/latest/docs/reference/config/istio.mesh.v1alpha1/#MeshConfig'
+diff --git a/tests/integration/pilot/zone_aware_lb_test.go b/tests/integration/pilot/zone_aware_lb_test.go
+new file mode 100644
+index 00000000000..153f1cbc7bf
+--- /dev/null
++++ b/tests/integration/pilot/zone_aware_lb_test.go
+@@ -0,0 +1,624 @@
++//go:build integ
++
++// Copyright Istio Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package pilot
++
++import (
++	"fmt"
++	"strings"
++	"testing"
++	"time"
++
++	admin "github.com/envoyproxy/go-control-plane/envoy/admin/v3"
++	cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++
++	"istio.io/api/annotation"
++	"istio.io/istio/pkg/test/framework"
++	"istio.io/istio/pkg/test/framework/components/echo"
++	"istio.io/istio/pkg/test/framework/components/echo/common/ports"
++	"istio.io/istio/pkg/test/framework/components/echo/deployment"
++	"istio.io/istio/pkg/test/util/retry"
++)
++
++const (
++	// localLocality must match the locality of the calling proxy (apps.A defaults to
++	// "region.zone.subzone" in the standard echo deployment).
++	localLocality           = "region/zone/subzone"
++	sameRegionZone2Locality = "region/zone2/subzone"
++	sameRegionZone3Locality = "region/zone3/subzone"
++	sameRegionZone4Locality = "region/zone4/subzone"
++	remoteRegionLocality    = "notregion/notzone/notsubzone"
++
++	// localClusterName matches xds.LocalClusterName in pilot. We hard-code it here so the
++	// integration test stays decoupled from pilot internals, but a mismatch should fail
++	// the static-cluster assertion below — which is the whole point.
++	localClusterName = "local_cluster"
++)
++
++// Zone-aware-routing configuration:
++//   - LocalSvc: a ServiceEntry whose endpoints model the caller service's
++//     source-zone distribution.
++//     This makes the proxy's local_cluster (the static cluster injected when
++//     ISTIO_META_ENABLE_SELF_DISCOVERY=true) resolve to a real service, exercising
++//     that side of the feature.
++//   - ZoneAwareSvc: the target ServiceEntry that selects WorkloadEntries by label.
++//     The DR enables ZoneAwareLbSetting with a configurable MinClusterSize (default 1,
++//     so Envoy zone-aware LB engages even with a single endpoint per zone). Raising it
++//     above the destination cluster's host count makes Envoy disable zone-aware routing.
++const zoneAwareConfig = `
++apiVersion: networking.istio.io/v1
++kind: ServiceEntry
++metadata:
++  name: local-svc
++spec:
++  hosts: ["{{ .LocalHost }}"]
++  ports:
++  - name: http
++    number: 80
++    protocol: HTTP
++  resolution: STATIC
++  workloadSelector:
++    labels:
++      app: zone-aware-local
++---
++apiVersion: networking.istio.io/v1
++kind: ServiceEntry
++metadata:
++  name: zone-aware-svc
++spec:
++  hosts: ["{{ .RemoteHost }}"]
++  ports:
++  - name: http
++    number: 80
++    protocol: HTTP
++  resolution: STATIC
++  workloadSelector:
++    labels:
++      app: zone-aware-backend
++---
++apiVersion: networking.istio.io/v1
++kind: DestinationRule
++metadata:
++  name: zone-aware-dr
++spec:
++  host: "{{ .RemoteHost }}"
++  trafficPolicy:
++    connectionPool:
++      tcp:
++        connectTimeout: 250ms
++{{ if .WithOutlierDetection }}
++    outlierDetection:
++      interval: 1s
++      baseEjectionTime: 10m
++      maxEjectionPercent: 100
++{{ end }}
++{{ if not .DisableZoneAware }}
++    loadBalancer:
++      zoneAwareLbSetting:
++        enabled: true
++        minClusterSize: {{ .MinClusterSize }}
++{{ end }}
++{{ range $i, $we := .LocalClusterWorkloads }}
++---
++apiVersion: networking.istio.io/v1
++kind: WorkloadEntry
++metadata:
++  name: zone-aware-local-we-{{ $i }}
++  labels:
++    service.istio.io/workload-name: {{ $.LocalClusterWorkloadName }}
++spec:
++  address: {{ $we.Address }}
++  locality: {{ $we.Locality }}
++  labels:
++    app: zone-aware-local
++{{ range $k, $v := $.LocalClusterLabels }}
++    {{ $k }}: {{ $v | quote }}
++{{ end }}
++{{ end }}
++{{ range $i, $we := .DestinationWorkloads }}
++---
++apiVersion: networking.istio.io/v1
++kind: WorkloadEntry
++metadata:
++  name: zone-aware-we-{{ $i }}
++spec:
++  address: {{ $we.Address }}
++  locality: {{ $we.Locality }}
++  labels:
++    app: zone-aware-backend
++{{ end }}
++`
++
++type weEntry struct {
++	Address  string
++	Locality string
++}
++
++type zoneAwareInput struct {
++	LocalHost                string
++	RemoteHost               string
++	LocalClusterWorkloadName string
++	LocalClusterLabels       map[string]string
++	LocalClusterWorkloads    []weEntry
++	DestinationWorkloads     []weEntry
++	WithOutlierDetection     bool
++	MinClusterSize           int
++	DisableZoneAware         bool
++}
++
++func TestZoneAwareLoadBalancer(t *testing.T) {
++	// nolint: staticcheck
++	framework.
++		NewTest(t).
++		RequiresSingleCluster().
++		Run(func(t framework.TestContext) {
++			// Deploy a dedicated caller with ISTIO_META_ENABLE_SELF_DISCOVERY=true so that
++			// only this proxy gets local_cluster injected, without a global mesh config change.
++			callerInstances := deployment.New(t).
++				WithConfig(echo.Config{
++					Service:   "zone-aware-caller",
++					Namespace: apps.Namespace,
++					Locality:  "region.zone.subzone",
++					Ports:     ports.All(),
++					Subsets: []echo.SubsetConfig{{
++						Annotations: map[string]string{
++							annotation.ProxyConfig.Name: `{"proxyMetadata":{"ISTIO_META_ENABLE_SELF_DISCOVERY":"true"}}`,
++						},
++					}},
++				}).
++				BuildOrFail(t)
++			caller := callerInstances[0]
++			destB := apps.B[0]
++			destC := apps.C[0]
++			proxyAddress := caller.WorkloadsOrFail(t)[0].Address()
++			sourcePeerAddress := destB.WorkloadsOrFail(t)[0].Address()
++			callerWorkloadName := workloadNameForEcho(caller)
++			callerLocalClusterLabels := localClusterLabelsForEcho(t, caller)
++			oneLocalClusterEndpoint := []weEntry{
++				{Address: proxyAddress, Locality: localLocality},
++			}
++			twoLocalClusterZones := []weEntry{
++				{Address: proxyAddress, Locality: localLocality},
++				{Address: sourcePeerAddress, Locality: sameRegionZone2Locality},
++			}
++
++			cases := []struct {
++				name                  string
++				localClusterWorkloads []weEntry
++				destinationWorkloads  []weEntry
++				withOutlierDetection  bool
++				minClusterSize        int
++				disableZoneAware      bool
++				expected              map[string]int
++			}{
++				{
++					name:                  "OneSourceEndpointOneDestinationEndpointSameLocality",
++					localClusterWorkloads: oneLocalClusterEndpoint,
++					destinationWorkloads: []weEntry{
++						{Address: destB.Address(), Locality: localLocality},
++					},
++					expected: expectAllTrafficTo(destB.Config().Service),
++				},
++				{
++					name:                  "OneSourceEndpointTwoDestinationLocalitiesSameRegionOverflows",
++					localClusterWorkloads: oneLocalClusterEndpoint,
++					destinationWorkloads: []weEntry{
++						{Address: destB.Address(), Locality: localLocality},
++						{Address: destC.Address(), Locality: sameRegionZone2Locality},
++					},
++					expected: map[string]int{
++						destB.Config().Service: sendCount / 2,
++						destC.Config().Service: sendCount / 2,
++					},
++				},
++				{
++					name:                  "TwoSourceZonesTwoDestinationEndpointsMatchingSourceZones",
++					localClusterWorkloads: twoLocalClusterZones,
++					destinationWorkloads: []weEntry{
++						{Address: destB.Address(), Locality: localLocality},
++						{Address: destC.Address(), Locality: sameRegionZone2Locality},
++					},
++					expected: expectAllTrafficTo(destB.Config().Service),
++				},
++				{
++					// Same topology as TwoSourceZonesTwoDestinationEndpointsMatchingSourceZones, but
++					// with no loadBalancer DR block (default locality LB, no outlier detection).
++					// Without zone-aware routing there is no mechanism to pin traffic to the local
++					// zone: no priorities are assigned and both same-region endpoints stay equal,
++					// so traffic splits evenly.
++					name:                  "ZoneAwareDisabledTwoSourceZonesTwoDestinationEndpointsMatchingSourceZones",
++					localClusterWorkloads: twoLocalClusterZones,
++					destinationWorkloads: []weEntry{
++						{Address: destB.Address(), Locality: localLocality},
++						{Address: destC.Address(), Locality: sameRegionZone2Locality},
++					},
++					disableZoneAware: true,
++					expected: map[string]int{
++						destB.Config().Service: sendCount / 2,
++						destC.Config().Service: sendCount / 2,
++					},
++				},
++				{
++					// Same setup as TwoSourceZonesTwoDestinationEndpointsMatchingSourceZones, which
++					// normally pins all traffic to the same-zone endpoint (destB). Raising
++					// minClusterSize above the destination cluster's host count makes Envoy disable
++					// zone-aware routing at runtime (the cluster is smaller than the configured
++					// threshold), so traffic falls back to an even split across both same-region zones.
++					// istiod still emits ZoneAwareLbConfig, so assertZoneAwareConfig continues to pass;
++					// only the runtime distribution changes.
++					name:                  "HighMinClusterSizeDisablesZoneAwareRouting",
++					localClusterWorkloads: twoLocalClusterZones,
++					destinationWorkloads: []weEntry{
++						{Address: destB.Address(), Locality: localLocality},
++						{Address: destC.Address(), Locality: sameRegionZone2Locality},
++					},
++					minClusterSize: 10,
++					expected: map[string]int{
++						destB.Config().Service: sendCount / 2,
++						destC.Config().Service: sendCount / 2,
++					},
++				},
++				{
++					name:                  "TwoSourceZonesTwoDestinationEndpointsDifferentSourceZones",
++					localClusterWorkloads: twoLocalClusterZones,
++					destinationWorkloads: []weEntry{
++						{Address: destB.Address(), Locality: sameRegionZone3Locality},
++						{Address: destC.Address(), Locality: sameRegionZone4Locality},
++					},
++					expected: map[string]int{
++						destB.Config().Service: sendCount / 2,
++						destC.Config().Service: sendCount / 2,
++					},
++				},
++				{
++					name:                  "CrossRegionEndpointIgnoredWhileSameRegionHealthy",
++					localClusterWorkloads: oneLocalClusterEndpoint,
++					destinationWorkloads: []weEntry{
++						{Address: destB.Address(), Locality: localLocality},
++						{Address: destC.Address(), Locality: remoteRegionLocality},
++					},
++					expected: expectAllTrafficTo(destB.Config().Service),
++				},
++				{
++					// Same topology as CrossRegionEndpointIgnoredWhileSameRegionHealthy, but with
++					// no loadBalancer DR block (default locality LB, no outlier detection).
++					// Without zone-aware region-bucketing, both endpoints are at equal priority
++					// and traffic splits evenly across the same-region and cross-region endpoints.
++					name:                  "ZoneAwareDisabledCrossRegionEndpointNotIgnored",
++					localClusterWorkloads: oneLocalClusterEndpoint,
++					destinationWorkloads: []weEntry{
++						{Address: destB.Address(), Locality: localLocality},
++						{Address: destC.Address(), Locality: remoteRegionLocality},
++					},
++					disableZoneAware: true,
++					expected: map[string]int{
++						destB.Config().Service: sendCount / 2,
++						destC.Config().Service: sendCount / 2,
++					},
++				},
++				{
++					// Verifies that a same-region endpoint in a *different* zone beats a cross-region
++					// endpoint. Without the region-bucketing in applyZoneAwareRegionalFailover, both land at
++					// priority 0 and Envoy's zone-aware LB distributes traffic to the remote region.
++					name:                  "CrossRegionEndpointIgnoredWhenSameRegionDifferentZoneAvailable",
++					localClusterWorkloads: oneLocalClusterEndpoint,
++					destinationWorkloads: []weEntry{
++						{Address: destB.Address(), Locality: sameRegionZone2Locality},
++						{Address: destC.Address(), Locality: remoteRegionLocality},
++					},
++					expected: expectAllTrafficTo(destB.Config().Service),
++				},
++				{
++					name:                  "CrossRegionEndpointUsedWhenSameRegionAbsent",
++					localClusterWorkloads: oneLocalClusterEndpoint,
++					destinationWorkloads: []weEntry{
++						{Address: destC.Address(), Locality: remoteRegionLocality},
++					},
++					expected: expectAllTrafficTo(destC.Config().Service),
++				},
++				{
++					// outlierDetection is required here: Envoy must detect and eject
++					// the unreachable same-region endpoint before falling over to the
++					// cross-region one.
++					name:                  "CrossRegionEndpointUsedAfterSameRegionEjection",
++					localClusterWorkloads: oneLocalClusterEndpoint,
++					withOutlierDetection:  true,
++					destinationWorkloads: []weEntry{
++						{Address: "10.99.99.99", Locality: localLocality},
++						{Address: destC.Address(), Locality: remoteRegionLocality},
++					},
++					expected: expectAllTrafficTo(destC.Config().Service),
++				},
++			}
++
++			for i, tc := range cases {
++				t.NewSubTest(tc.name).Run(func(t framework.TestContext) {
++					hostSuffix := fmt.Sprintf("case-%d", i)
++					minClusterSize := tc.minClusterSize
++					if minClusterSize == 0 {
++						minClusterSize = 1
++					}
++					input := zoneAwareInput{
++						LocalHost:                fmt.Sprintf("local-%s.example.com", hostSuffix),
++						RemoteHost:               fmt.Sprintf("zone-aware-%s.example.com", hostSuffix),
++						LocalClusterWorkloadName: callerWorkloadName,
++						LocalClusterLabels:       callerLocalClusterLabels,
++						LocalClusterWorkloads:    tc.localClusterWorkloads,
++						DestinationWorkloads:     tc.destinationWorkloads,
++						WithOutlierDetection:     tc.withOutlierDetection,
++						MinClusterSize:           minClusterSize,
++						DisableZoneAware:         tc.disableZoneAware,
++					}
++					t.ConfigIstio().
++						Eval(apps.Namespace.Name(), input, zoneAwareConfig).
++						ApplyOrFail(t)
++
++					// For cases where zone-aware is enabled, verify the proxy's Envoy config
++					// is actually using zone-aware LB (not just locality LB defaults):
++					//   1. local_cluster is present as a static cluster
++					//   2. local_cluster has exactly the expected endpoint count (CLA populated via EDS)
++					//   3. the remote-host cluster uses zone_aware_lb_config, not locality_weighted
++					// For disabled cases, wait for EDS to converge on the destination cluster
++					// before sending traffic so the distribution assertion is meaningful.
++					if !tc.disableZoneAware {
++						assertZoneAwareConfig(t, caller, input.RemoteHost, len(tc.localClusterWorkloads), tc.destinationWorkloads)
++					} else {
++						waitForDestinationEndpoints(t, caller, input.RemoteHost, len(tc.destinationWorkloads))
++					}
++
++					sendTrafficOrFail(t, caller, input.RemoteHost, tc.expected)
++				})
++			}
++		})
++}
++
++func workloadNameForEcho(inst echo.Instance) string {
++	cfg := inst.Config()
++	version := cfg.Version
++	if len(cfg.Subsets) > 0 {
++		version = cfg.Subsets[0].Version
++	}
++	return fmt.Sprintf("%s-%s", cfg.Service, version)
++}
++
++func localClusterLabelsForEcho(t framework.TestContext, inst echo.Instance) map[string]string {
++	t.Helper()
++	workload := inst.WorkloadsOrFail(t)[0]
++	pod, err := workload.Cluster().Kube().CoreV1().Pods(inst.NamespaceName()).Get(
++		t.Context(), workload.PodName(), metav1.GetOptions{},
++	)
++	if err != nil {
++		t.Fatalf("failed getting caller pod %s/%s labels: %v", inst.NamespaceName(), workload.PodName(), err)
++	}
++
++	out := map[string]string{}
++	for _, k := range []string{"pod-template-hash", "rollouts-pod-template-hash"} {
++		if v := pod.Labels[k]; v != "" {
++			out[k] = v
++		}
++	}
++	return out
++}
++
++// assertZoneAwareConfig waits for the caller's Envoy config to reflect zone-aware routing.
++// Envoy's /config_dump endpoint omits endpoint data by default, so we use two separate
++// admin queries: /config_dump for cluster definitions (LocalityConfigSpecifier) and
++// /clusters?format=json for runtime host status (proves local_cluster is populated).
++func assertZoneAwareConfig(
++	t framework.TestContext,
++	caller echo.Instance,
++	remoteHost string,
++	expectedLocalClusterHosts int,
++	destinationWorkloads []weEntry,
++) {
++	t.Helper()
++	sidecar := caller.WorkloadsOrFail(t)[0].Sidecar()
++	remoteClusterName := fmt.Sprintf("outbound|80||%s", remoteHost)
++	expectedDestinationHosts := expectedDestinationHostPriorities(destinationWorkloads)
++
++	// First: assert cluster definitions are correct.
++	sidecar.WaitForConfigOrFail(t, func(cd *admin.ConfigDump) (bool, error) {
++		clusters, err := extractClusters(cd)
++		if err != nil {
++			return false, err
++		}
++
++		var local, remote *cluster.Cluster
++		for _, c := range clusters {
++			switch c.GetName() {
++			case localClusterName:
++				local = c
++			case remoteClusterName:
++				remote = c
++			}
++		}
++		if local == nil {
++			return false, fmt.Errorf("static cluster %q not found in proxy config — "+
++				"ISTIO_META_ENABLE_SELF_DISCOVERY did not propagate to sidecar bootstrap", localClusterName)
++		}
++		if remote == nil {
++			return false, fmt.Errorf("dynamic cluster %q not yet present", remoteClusterName)
++		}
++
++		switch remote.GetCommonLbConfig().GetLocalityConfigSpecifier().(type) {
++		case *cluster.Cluster_CommonLbConfig_ZoneAwareLbConfig_:
++			// ok
++		case *cluster.Cluster_CommonLbConfig_LocalityWeightedLbConfig_:
++			return false, fmt.Errorf("cluster %q has LocalityWeightedLbConfig — istiod did not "+
++				"emit ZoneAwareLbConfig (is ISTIO_META_ENABLE_SELF_DISCOVERY set in proxyMetadata?)", remoteClusterName)
++		default:
++			return false, fmt.Errorf("cluster %q has unexpected LocalityConfigSpecifier %T — expected ZoneAwareLbConfig",
++				remoteClusterName, remote.GetCommonLbConfig().GetLocalityConfigSpecifier())
++		}
++		return true, nil
++	}, retry.Delay(time.Second), retry.Timeout(30*time.Second))
++
++	// Second: assert local_cluster and the destination cluster have the expected live hosts
++	// via /clusters (config_dump excludes EDS data).
++	retry.UntilSuccessOrFail(t, func() error {
++		clusters, err := sidecar.Clusters()
++		if err != nil {
++			return err
++		}
++		foundLocalCluster := false
++		foundRemoteCluster := false
++		for _, cs := range clusters.GetClusterStatuses() {
++			switch cs.GetName() {
++			case localClusterName:
++				foundLocalCluster = true
++				got := len(cs.GetHostStatuses())
++				if got != expectedLocalClusterHosts {
++					return fmt.Errorf("cluster %q has %d hosts, expected %d — local_cluster EDS has unexpected endpoints",
++						localClusterName, got, expectedLocalClusterHosts)
++				}
++			case remoteClusterName:
++				foundRemoteCluster = true
++				if err := assertDestinationHosts(cs, expectedDestinationHosts); err != nil {
++					return err
++				}
++			}
++		}
++		if !foundLocalCluster {
++			return fmt.Errorf("cluster %q not present in /clusters output", localClusterName)
++		}
++		if !foundRemoteCluster {
++			return fmt.Errorf("cluster %q not present in /clusters output", remoteClusterName)
++		}
++		return nil
++	}, retry.Delay(time.Second), retry.Timeout(30*time.Second))
++}
++
++// waitForDestinationEndpoints waits until the remote cluster is present in the caller's
++// /clusters output and has exactly expectedCount live hosts. Used for cases where
++// assertZoneAwareConfig is not called (e.g. zone-aware LB is disabled in the DR) to
++// ensure EDS has converged before sending traffic.
++func waitForDestinationEndpoints(
++	t framework.TestContext,
++	caller echo.Instance,
++	remoteHost string,
++	expectedCount int,
++) {
++	t.Helper()
++	sidecar := caller.WorkloadsOrFail(t)[0].Sidecar()
++	remoteClusterName := fmt.Sprintf("outbound|80||%s", remoteHost)
++
++	retry.UntilSuccessOrFail(t, func() error {
++		clusters, err := sidecar.Clusters()
++		if err != nil {
++			return err
++		}
++		for _, cs := range clusters.GetClusterStatuses() {
++			if cs.GetName() != remoteClusterName {
++				continue
++			}
++			got := len(cs.GetHostStatuses())
++			if got != expectedCount {
++				return fmt.Errorf("cluster %q has %d hosts, waiting for %d",
++					remoteClusterName, got, expectedCount)
++			}
++			return nil
++		}
++		return fmt.Errorf("cluster %q not yet present in /clusters output", remoteClusterName)
++	}, retry.Delay(time.Second), retry.Timeout(30*time.Second))
++}
++
++func expectedDestinationHostPriorities(workloads []weEntry) map[string]uint32 {
++	raw := make(map[string]int, len(workloads))
++	seenRawPriority := map[int]bool{}
++	for _, we := range workloads {
++		priority := 0
++		if localityRegion(we.Locality) != localityRegion(localLocality) {
++			priority = 1
++		}
++		raw[we.Address] = priority
++		seenRawPriority[priority] = true
++	}
++
++	compacted := map[int]uint32{}
++	if seenRawPriority[0] {
++		compacted[0] = 0
++		if seenRawPriority[1] {
++			compacted[1] = 1
++		}
++	} else if seenRawPriority[1] {
++		compacted[1] = 0
++	}
++
++	out := make(map[string]uint32, len(raw))
++	for address, priority := range raw {
++		out[address] = compacted[priority]
++	}
++	return out
++}
++
++func assertDestinationHosts(cs *admin.ClusterStatus, expected map[string]uint32) error {
++	got := map[string]uint32{}
++	for _, hs := range cs.GetHostStatuses() {
++		socketAddress := hs.GetAddress().GetSocketAddress()
++		if socketAddress == nil {
++			return fmt.Errorf("cluster %q has host without socket address: %v", cs.GetName(), hs.GetAddress())
++		}
++		got[socketAddress.GetAddress()] = hs.GetPriority()
++	}
++	for address, priority := range expected {
++		if gotPriority, ok := got[address]; !ok {
++			return fmt.Errorf("cluster %q missing destination host %s; expected hosts %v, got hosts %v",
++				cs.GetName(), address, expected, got)
++		} else if gotPriority != priority {
++			return fmt.Errorf("cluster %q destination host %s has priority %d, expected %d; expected hosts %v, got hosts %v",
++				cs.GetName(), address, gotPriority, priority, expected, got)
++		}
++	}
++	for address := range got {
++		if _, ok := expected[address]; !ok {
++			return fmt.Errorf("cluster %q has unexpected destination host %s; expected hosts %v, got hosts %v",
++				cs.GetName(), address, expected, got)
++		}
++	}
++	return nil
++}
++
++func localityRegion(locality string) string {
++	region, _, _ := strings.Cut(locality, "/")
++	return region
++}
++
++func extractClusters(cd *admin.ConfigDump) ([]*cluster.Cluster, error) {
++	var out []*cluster.Cluster
++	for _, c := range cd.GetConfigs() {
++		if c.GetTypeUrl() != "type.googleapis.com/envoy.admin.v3.ClustersConfigDump" {
++			continue
++		}
++		dump := &admin.ClustersConfigDump{}
++		if err := c.UnmarshalTo(dump); err != nil {
++			return nil, err
++		}
++		for _, sc := range dump.StaticClusters {
++			ct := &cluster.Cluster{}
++			if sc.Cluster != nil && sc.Cluster.UnmarshalTo(ct) == nil {
++				out = append(out, ct)
++			}
++		}
++		for _, dc := range dump.DynamicActiveClusters {
++			ct := &cluster.Cluster{}
++			if dc.Cluster != nil && dc.Cluster.UnmarshalTo(ct) == nil {
++				out = append(out, ct)
++			}
++		}
++	}
++	return out, nil
++}
+diff --git a/tools/packaging/common/envoy_bootstrap.json b/tools/packaging/common/envoy_bootstrap.json
+index c60474fbe40..1f727f0ec60 100644
+--- a/tools/packaging/common/envoy_bootstrap.json
++++ b/tools/packaging/common/envoy_bootstrap.json
+@@ -557,6 +557,37 @@
+         }
+       }
+       {{ end }}
++      {{ if .enable_self_discovery }}
++      ,
++      {
++        "name": "local_cluster",
++        "alt_stat_name": "local_cluster;",
++        "type": "EDS",
++        "connect_timeout": "1s",
++        "load_balancing_policy": {
++          "policies": [{
++            "typed_extension_config": {
++              "name": "envoy.load_balancing_policies.least_request",
++              "typed_config": {
++                "@type": "type.googleapis.com/envoy.extensions.load_balancing_policies.least_request.v3.LeastRequest",
++                "locality_lb_config": {
++                  "zone_aware_lb_config": {
++                    "min_cluster_size": "1"
++                  }
++                }
++              }
++            }
++          }]
++        },
++        "eds_cluster_config": {
++          "eds_config": {
++            "ads": {},
++            "resource_api_version": "V3"
++          },
++          "service_name": "local_cluster"
++        }
++      }
++      {{ end }}
+     ],
+     "listeners":[
+       {
+@@ -1070,21 +1101,21 @@
+     {{ end }}
+   ]
+   {{ end }}
+-  {{ if or .outlier_log_path .load_stats_config_json_str}}
++  {{ if or .outlier_log_path .load_stats_config_json_str .enable_self_discovery }}
+   ,
+   "cluster_manager": {
+-    "enable_deferred_cluster_creation": true,
++    {{- if .enable_self_discovery }}
++    "local_cluster_name": "local_cluster",
++    {{- end }}
+     {{- if .outlier_log_path}}
+     "outlier_detection": {
+       "event_log_path": "{{ .outlier_log_path }}"
+-    }
+-    {{- end}}
+-    {{- if and .outlier_log_path .load_stats_config_json_str }}
+-    ,
++    },
+     {{- end}}
+     {{- if .load_stats_config_json_str }}
+-    "load_stats_config": {{- .load_stats_config_json_str }}
++    "load_stats_config": {{- .load_stats_config_json_str }},
+     {{- end }}
++    "enable_deferred_cluster_creation": true
+   }
+   {{- end }}
+   ,
